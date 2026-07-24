@@ -833,7 +833,7 @@ function breakdownRows(kind: 'models' | 'api_keys' | 'credentials'): RankingRow[
         <StatTile
           class="sm:order-1 xl:order-1"
           label="请求数"
-          :value="formatCompactNumber(totals?.request_count ?? 0)"
+          :value="totals === undefined ? '-' : formatCompactNumber(totals.request_count)"
           tone="brand"
           :icon="Activity"
           meta="当前筛选范围"

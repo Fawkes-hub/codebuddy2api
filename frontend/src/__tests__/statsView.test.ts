@@ -349,6 +349,25 @@ describe('StatsView', () => {
     expect(statsOverviewMock).toHaveBeenLastCalledWith(expect.objectContaining(customRange));
   });
 
+  it('请求数首次加载时显示占位符，成功返回零后才显示 0', async () => {
+    const wrapper = mountView();
+    const requestCountTile = () =>
+      wrapper.findAllComponents(StatTile).find((tile) => tile.props('label') === '请求数')!;
+
+    expect(requestCountTile().props('value')).toBe('-');
+
+    queries[0].data.value = {
+      ...overview,
+      totals: { ...overview.totals, request_count: 0 },
+    };
+    await nextTick();
+    expect(requestCountTile().props('value')).toBe('0');
+
+    queries[0].isFetching.value = true;
+    await nextTick();
+    expect(requestCountTile().props('value')).toBe('0');
+  });
+
   it('展示六项 KPI，将成功率与缓存命中率放入对应卡片的环形图', async () => {
     queries[0].data.value = overview;
     queries[1].data.value = { items: [firstRequest], next_cursor: 9 };

@@ -2,7 +2,7 @@
 import { computed, onUnmounted, ref, watch } from 'vue';
 import { useQuery } from '@tanstack/vue-query';
 import { useRouter } from 'vue-router';
-import { Activity, CheckCircle2, Clock3, KeyRound, Link } from '@lucide/vue';
+import { Activity, CheckCircle2, CircleSlash, Clock3, KeyRound, Link } from '@lucide/vue';
 import StatTile from '../components/StatTile.vue';
 import RefreshButton from '../components/RefreshButton.vue';
 import CAlert from '../components/ui/CAlert.vue';
@@ -70,6 +70,7 @@ const serviceTone = computed<'brand' | 'success' | 'warning' | 'error'>(() => {
   if (statusLoading.value) return 'brand';
   return statusData.value?.status === 'healthy' ? 'success' : 'warning';
 });
+const serviceIcon = computed(() => (isError.value ? CircleSlash : CheckCircle2));
 const nowMs = ref(Date.now());
 const uptimeSnapshotSeconds = ref<number | null>(null);
 const uptimeSnapshotMs = ref(nowMs.value);
@@ -165,7 +166,18 @@ const uptimeDisplay = computed(() => buildUptimeDisplay(runningUptimeSeconds.val
 const todayStatsTotals = computed(() =>
   todayStatsQuery.isError.value ? undefined : todayStatsQuery.data.value?.totals,
 );
-const todayRequestCount = computed(() => todayStatsTotals.value?.request_count ?? 0);
+const todayRequestValue = computed(() => {
+  const totals = todayStatsTotals.value;
+  return totals === undefined ? '-' : totals.request_count;
+});
+const todayRequestLabel = computed(() => {
+  if (todayStatsQuery.isError.value) return '今日请求获取失败';
+  if (todayStatsTotals.value?.request_count === 0) return '今日暂无请求';
+  return '今日请求';
+});
+const todayRequestTone = computed(() =>
+  todayStatsQuery.isError.value ? ('error' as const) : ('warning' as const),
+);
 const todaySuccessRatePercentage = computed(() => {
   const rate = todayStatsTotals.value?.success_rate;
   return rate === null || rate === undefined ? null : Math.round(rate * 100);
@@ -177,11 +189,19 @@ const todaySuccessRateTooltip = computed(() => {
   return `成功 ${formatCompactNumber(successCount)} / 总请求 ${formatCompactNumber(totals.request_count)}（${formatPercent(totals.success_rate)}）`;
 });
 
-const validityPercent = computed(() => {
-  const valid = statusData.value?.credentials.valid ?? 0;
-  const total = statusData.value?.credentials.total ?? 0;
-  return computeValidityPercent(valid, total);
-});
+const credentialValid = computed(() => statusData.value?.credentials.valid);
+const credentialTotal = computed(() => statusData.value?.credentials.total);
+const credentialValue = computed(() =>
+  credentialValid.value === undefined || credentialTotal.value === undefined
+    ? '-'
+    : `${credentialValid.value}/${credentialTotal.value}`,
+);
+const validityPercent = computed(() =>
+  computeValidityPercent(credentialValid.value ?? 0, credentialTotal.value ?? 0),
+);
+const credentialProgressLabel = computed(() =>
+  credentialTotal.value === undefined || credentialTotal.value === 0 ? '-' : undefined,
+);
 
 const combinedFetching = computed(
   () => statusQuery.isFetching.value || todayStatsQuery.isFetching.value,
@@ -231,25 +251,30 @@ function openStats(): void {
         label="服务状态"
         :value="describeServiceStatus(statusData?.status, isError, statusLoading)"
         :tone="serviceTone"
-        :icon="CheckCircle2"
+        :icon="serviceIcon"
         :meta="statusData?.service"
         :class="{ 'animate-success': statusRecovered }"
       />
       <StatTile
         label="有效凭证"
-        :value="`${statusData?.credentials.valid ?? 0}/${statusData?.credentials.total ?? 0}`"
+        :value="credentialValue"
         :tone="isError ? 'error' : 'brand'"
         :icon="KeyRound"
         :meta="describeCredentialStatus(statusData?.credentials.current.status)"
       >
         <template #corner>
-          <CProgress :percentage="validityPercent" :stroke-width="5" :size="52" />
+          <CProgress
+            :percentage="validityPercent"
+            :label="credentialProgressLabel"
+            :stroke-width="5"
+            :size="52"
+          />
         </template>
       </StatTile>
       <StatTile
-        label="今日请求"
-        :value="todayStatsQuery.isError.value ? '-' : todayRequestCount"
-        tone="warning"
+        :label="todayRequestLabel"
+        :value="todayRequestValue"
+        :tone="todayRequestTone"
         :icon="Activity"
         meta="查看持久化统计"
         class="cursor-pointer"

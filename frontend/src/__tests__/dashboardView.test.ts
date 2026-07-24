@@ -1,4 +1,5 @@
 import { mount } from '@vue/test-utils';
+import { CircleSlash } from '@lucide/vue';
 import { ref } from 'vue';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -52,7 +53,7 @@ function mountView() {
         RefreshButton: RefreshButtonStub,
         StatTile: {
           inheritAttrs: false,
-          props: ['label', 'value', 'tone', 'meta'],
+          props: ['label', 'value', 'tone', 'icon', 'meta'],
           emits: ['click'],
           template:
             '<div class="stat" v-bind="$attrs" @click="$emit(\'click\')">{{ label }}|{{ value }}|{{ tone }}|{{ meta }}<slot name="corner" /></div>',
@@ -101,9 +102,11 @@ describe('DashboardView', () => {
 
     expect(wrapper.text()).toContain('服务状态|加载中|brand');
     expect(wrapper.text()).not.toContain('服务状态|异常');
-    expect(wrapper.text()).toContain('0/0');
-    expect(wrapper.text()).toContain('今日请求|0');
+    expect(wrapper.text()).toContain('有效凭证|-|brand');
+    expect(wrapper.text()).not.toContain('0/0');
+    expect(wrapper.text()).toContain('今日请求|-|warning');
     expect(wrapper.text()).toContain('-');
+    expect(wrapper.findComponent(CProgress).props('label')).toBe('-');
 
     const copyButton = wrapper.findAll('button').find((button) => button.text().includes('复制'));
     await copyButton?.trigger('click');
@@ -127,7 +130,7 @@ describe('DashboardView', () => {
     const wrapper = mountView();
     const state = (wrapper.vm.$ as any).setupState;
 
-    expect(state.todayRequestCount).toBe(7);
+    expect(state.todayRequestValue).toBe(7);
     expect(state.validityPercent).toBe(66);
     expect(wrapper.text()).toContain('运行中');
     expect(wrapper.text()).toContain('服务状态|运行中|success');
@@ -164,6 +167,25 @@ describe('DashboardView', () => {
 
     await todayRequestTile.trigger('click');
     expect(pushMock).toHaveBeenCalledWith({ name: 'stats' });
+  });
+
+  it('今日统计加载成功但没有请求时显示暂无请求', () => {
+    queries[1].data.value = { totals: { request_count: 0, success_rate: null } };
+
+    const wrapper = mountView();
+
+    expect(wrapper.text()).toContain('今日暂无请求|0|warning');
+  });
+
+  it('状态加载成功且没有凭证时才显示 0/0', () => {
+    queries[0].data.value = {
+      credentials: { valid: 0, total: 0, current: { status: 'no_credentials' } },
+    };
+
+    const wrapper = mountView();
+
+    expect(wrapper.text()).toContain('有效凭证|0/0|brand|暂无凭证');
+    expect(wrapper.findComponent(CProgress).props('label')).toBe('-');
   });
 
   it('按总览页策略配置状态和今日统计查询', () => {
@@ -259,10 +281,12 @@ describe('DashboardView', () => {
 
     expect(wrapper.text()).toContain('加载状态失败');
     expect(wrapper.text()).toContain('服务状态|加载失败|error');
-    expect(wrapper.text()).toContain('有效凭证|0/0');
+    expect(wrapper.text()).toContain('有效凭证|-|error');
+    expect(wrapper.findComponent(CProgress).props('label')).toBe('-');
     expect(wrapper.text()).not.toContain('stale-service');
     expect(wrapper.text()).not.toContain('https://stale.example');
     expect(wrapper.text()).not.toContain('00:01:39');
+    expect((wrapper.vm.$ as any).setupState.serviceIcon).toBe(CircleSlash);
     const retry = wrapper.findAll('button').find((button) => button.text().includes('重试'))!;
     await retry.trigger('click');
     expect(queries[0].refetch).toHaveBeenCalledOnce();
@@ -290,7 +314,7 @@ describe('DashboardView', () => {
     queries[1].error.value = new Error('stats failed');
     const wrapper = mountView();
 
-    expect(wrapper.text()).toContain('今日请求|-');
+    expect(wrapper.text()).toContain('今日请求获取失败|-|error');
     expect(wrapper.text()).toContain('加载今日请求统计失败');
     const todayRequestTile = wrapper
       .findAll('.stat')
