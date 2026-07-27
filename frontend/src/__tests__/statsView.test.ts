@@ -66,7 +66,7 @@ const overview = {
     },
   ],
   dimensions: {
-    models: ['glm'],
+    models: ['model:glm'],
     api_keys: [{ id: 'key-1', name: '机器人' }],
     credentials: [{ id: 'cred-1', label: '账号 A' }],
     outcomes: ['success', 'failure', 'cancelled'],
@@ -74,7 +74,7 @@ const overview = {
   breakdowns: {
     models: [
       {
-        model: 'glm',
+        model: 'model:glm',
         request_count: 10,
         success_rate: 0.9,
         total_tokens: 1000,
@@ -462,13 +462,13 @@ describe('StatsView', () => {
     expect(selects.some((select) => select.text().includes('glm'))).toBe(true);
     expect(selects.some((select) => select.text().includes('机器人'))).toBe(true);
     expect(selects.some((select) => select.text().includes('账号 A'))).toBe(true);
-    await selects[0]!.setValue('glm');
+    await selects[0]!.setValue('model:glm');
     await selects[1]!.setValue('key-1');
     await selects[2]!.setValue('cred-1');
     await selects[3]!.setValue('failure');
     expect(state.queryParams).toEqual(
       expect.objectContaining({
-        model: 'glm',
+        model: 'model:glm',
         api_key_id: 'key-1',
         credential_id: 'cred-1',
         outcome: 'failure',
@@ -638,7 +638,7 @@ describe('StatsView', () => {
     expect(clearButton.find('.lucide-eraser').exists()).toBe(true);
     expect(clearButton.attributes('disabled')).toBeDefined();
     state.filters.traffic = 'external';
-    state.filters.model = 'glm';
+    state.filters.model = 'model:glm';
     state.filters.apiKeyId = 'key-1';
     state.filters.credentialId = 'cred-1';
     state.filters.outcome = 'failure';
@@ -1264,9 +1264,9 @@ describe('StatsView', () => {
   it('完整维度抽屉支持搜索分页并可从筛选模式选择项目', async () => {
     const wrapper = mountView();
     const state = (wrapper.vm.$ as any).setupState;
-    state.filters.model = 'current-model';
+    state.filters.model = 'model:current-model';
     statsDimensionsMock.mockResolvedValueOnce({
-      items: [dimensionItem('other-model', 'Other')],
+      items: [dimensionItem('model:other-model', 'Other')],
       next_cursor: 'next',
     });
 
@@ -1274,9 +1274,9 @@ describe('StatsView', () => {
 
     expect(statsDimensionsMock).toHaveBeenCalledWith(
       'models',
-      expect.not.objectContaining({ model: 'current-model' }),
+      expect.not.objectContaining({ model: 'model:current-model' }),
     );
-    expect(state.dimensionItems[0].id).toBe('other-model');
+    expect(state.dimensionItems[0].id).toBe('model:other-model');
     expect(state.dimensionNextCursor).toBe('next');
     await nextTick();
     expect(wrapper.text()).toContain('other-model');
@@ -1284,8 +1284,72 @@ describe('StatsView', () => {
       .findAll('button')
       .find((button) => button.text() === '选择')!
       .trigger('click');
-    expect(state.filters.model).toBe('other-model');
+    expect(state.filters.model).toBe('model:other-model');
     expect(state.dimensionOpen).toBe(false);
+  });
+
+  it('区分名为 other 的真实模型与其他模型桶', async () => {
+    queries[0].data.value = {
+      ...overview,
+      dimensions: {
+        ...overview.dimensions,
+        models: ['model:other', 'other', 'model:unknown', 'unknown'],
+      },
+      breakdowns: {
+        ...overview.breakdowns,
+        models: [
+          { ...overview.breakdowns.models[0], model: 'model:other' },
+          { ...overview.breakdowns.models[0], model: 'other' },
+          { ...overview.breakdowns.models[0], model: 'model:unknown' },
+          { ...overview.breakdowns.models[0], model: 'unknown' },
+        ],
+      },
+    };
+    statsDimensionsMock.mockResolvedValueOnce({
+      items: [
+        dimensionItem('model:other', 'model:other'),
+        dimensionItem('other', 'other'),
+        dimensionItem('model:unknown', 'model:unknown'),
+        dimensionItem('unknown', 'unknown'),
+      ],
+      next_cursor: null,
+    });
+    const wrapper = mountView();
+    const state = (wrapper.vm.$ as any).setupState;
+
+    expect(state.modelOptions.slice(1)).toEqual([
+      { value: 'model:other', label: 'other' },
+      { value: 'other', label: '其他' },
+      { value: 'model:unknown', label: 'unknown' },
+      { value: 'unknown', label: '未知' },
+    ]);
+    expect(state.breakdownRows('models')[0]).toEqual(
+      expect.objectContaining({ id: 'model:other', label: 'other' }),
+    );
+    expect(state.breakdownRows('models')[1]).toEqual(
+      expect.objectContaining({ id: 'other', label: '其他' }),
+    );
+    expect(state.breakdownRows('models')[2]).toEqual(
+      expect.objectContaining({ id: 'model:unknown', label: 'unknown' }),
+    );
+    expect(state.breakdownRows('models')[3]).toEqual(
+      expect.objectContaining({ id: 'unknown', label: '未知' }),
+    );
+
+    await state.openDimensionExplorer('models');
+    expect(state.dimensionItems[0]).toEqual(
+      expect.objectContaining({ id: 'model:other', label: 'other' }),
+    );
+    expect(state.dimensionItems[1]).toEqual(
+      expect.objectContaining({ id: 'other', label: '其他' }),
+    );
+    expect(state.dimensionItems[2]).toEqual(
+      expect.objectContaining({ id: 'model:unknown', label: 'unknown' }),
+    );
+    expect(state.dimensionItems[3]).toEqual(
+      expect.objectContaining({ id: 'unknown', label: '未知' }),
+    );
+    expect(wrapper.text()).toContain('其他');
   });
 
   it('筛选候选始终可清除、保留失配值，并可从所有入口打开完整列表', async () => {
@@ -1293,13 +1357,13 @@ describe('StatsView', () => {
     const wrapper = mountView();
     const state = (wrapper.vm.$ as any).setupState;
 
-    state.filters.model = 'missing-model';
+    state.filters.model = 'model:missing-model';
     state.filters.apiKeyId = 'missing-key';
     state.filters.credentialId = 'missing-credential';
     state.filters.outcome = 'future';
     await nextTick();
     expect(state.modelOptions.at(-1)).toEqual({
-      value: 'missing-model',
+      value: 'model:missing-model',
       label: 'missing-model',
     });
     expect(state.apiKeyOptions.at(-1)).toEqual({ value: 'missing-key', label: 'missing-key' });
@@ -1308,9 +1372,11 @@ describe('StatsView', () => {
       label: 'missing-credential',
     });
     expect(state.outcomeOptions.at(-1)).toEqual({ value: 'future', label: 'future' });
-    state.filters.model = 'glm';
+    state.filters.model = 'model:glm';
     await nextTick();
-    expect(state.modelOptions.filter((option: any) => option.value === 'glm')).toHaveLength(1);
+    expect(state.modelOptions.filter((option: any) => option.value === 'model:glm')).toHaveLength(
+      1,
+    );
 
     state.setDetailOpen(true);
     expect(state.detailOpen).toBe(true);

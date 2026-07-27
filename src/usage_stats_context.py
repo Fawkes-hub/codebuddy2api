@@ -5,7 +5,8 @@ import re
 import time
 from typing import Any, Callable, Iterable, Mapping, Optional
 
-from .auth_types import AuthenticatedUser
+from .api_key_store import API_KEY_ENCODED_LENGTH
+from .auth_types import API_KEY_PREFIX, AuthenticatedUser
 from .stream_service import StreamObservation
 from .usage_stats_middleware import USAGE_STATS_CONTEXT_STATE_KEY
 from .usage_stats_store import UsageEvent, UsageStatsStore, normalize_usage, usage_stats_store
@@ -43,6 +44,11 @@ _MODEL_IDENTIFIER_PATTERN = re.compile(
     r"[A-Za-z0-9][A-Za-z0-9._:/@+\-]{0,199}",
     re.ASCII,
 )
+_API_KEY_CREDENTIAL_PATTERN = re.compile(
+    rf"{re.escape(API_KEY_PREFIX)}[A-Za-z0-9_-]{{{API_KEY_ENCODED_LENGTH}}}",
+    re.ASCII,
+)
+_UNSUCCESSFUL_REQUEST_MODEL_MAX_LENGTH = 64
 
 
 def _normalize_error_type(error_type: Any, status_code: Optional[int]) -> str:
@@ -312,10 +318,42 @@ class UsageStatsContext:
 
         requested_model = self._requested_model
         upstream_model = self._upstream_model
-        if outcome == "success" and self._confirmed_upstream_model is not None:
+        model_bucket_type = "unknown"
+        model_bucket_model = None
+        model_known = False
+        initial_model = upstream_model or self._controlled_model(
+            self._requested_model_candidate
+        )
+        if initial_model is not None:
+            model_bucket_type = "known"
+            model_bucket_model = initial_model
+            model_known = True
+        model_candidate = self._requested_model_candidate
+        if outcome in ("failure", "cancelled") and self._requested_model_candidate is not None:
+            if _API_KEY_CREDENTIAL_PATTERN.fullmatch(self._requested_model_candidate):
+                requested_model = "unknown"
+                model_candidate = None
+                model_bucket_type = "unknown"
+                model_bucket_model = None
+                model_known = False
+            else:
+                if len(self._requested_model_candidate) > _UNSUCCESSFUL_REQUEST_MODEL_MAX_LENGTH:
+                    requested_model = "unknown"
+                elif requested_model == "unknown":
+                    requested_model = self._requested_model_candidate
+                controlled_model = self._controlled_model(self._requested_model_candidate)
+                if controlled_model is None and upstream_model is not None:
+                    controlled_model = upstream_model
+                model_bucket_type = "known" if controlled_model is not None else "other"
+                model_bucket_model = controlled_model
+                model_known = controlled_model is not None
+        elif outcome == "success" and self._confirmed_upstream_model is not None:
             upstream_model = self._confirmed_upstream_model
             if requested_model == "unknown":
                 requested_model = upstream_model
+            model_bucket_type = "known"
+            model_bucket_model = upstream_model
+            model_known = True
 
         usage = self._usage
         event = UsageEvent(
@@ -323,6 +361,10 @@ class UsageStatsContext:
             requested_model=requested_model,
             occurred_at=self._occurred_at,
             upstream_model=upstream_model,
+            model_bucket_type=model_bucket_type,
+            model_bucket_model=model_bucket_model,
+            model_candidate=model_candidate,
+            model_known=model_known,
             api_key_id=self._api_key_id,
             api_key_name=self._api_key_name,
             credential_id=self._credential_id,

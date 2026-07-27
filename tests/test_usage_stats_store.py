@@ -225,6 +225,188 @@ class UsageStatsStoreTests(unittest.TestCase):
         self.assertEqual({row[0] for row in histograms}, {"first_output", "total"})
         self.assertEqual({row[2] for row in histograms}, {1})
 
+    def test_model_bucket_separates_detail_value_and_reuses_registered_models(self):
+        confirmed_id = self.record(self.event(
+            requested_model="provider/model-a",
+            upstream_model="model-a",
+            model_bucket_type="known",
+            model_bucket_model="model-a",
+            model_candidate="model-a",
+            model_known=True,
+        ))
+        rogue_id = self.record(self.event(
+            requested_model="rogue-model",
+            upstream_model=None,
+            model_bucket_type="other",
+            model_candidate="rogue-model",
+            outcome="failure",
+            http_status=400,
+            result_status=400,
+        ))
+        second_rogue_id = self.record(self.event(
+            requested_model="another-rogue-model",
+            upstream_model=None,
+            model_bucket_type="other",
+            model_candidate="another-rogue-model",
+            outcome="failure",
+            http_status=400,
+            result_status=400,
+        ))
+        known_failure_id = self.record(self.event(
+            requested_model="model-a",
+            upstream_model=None,
+            model_bucket_type="other",
+            model_candidate="model-a",
+            outcome="failure",
+            http_status=400,
+            result_status=400,
+        ))
+        overlong_id = self.record(self.event(
+            requested_model="unknown",
+            upstream_model=None,
+            model_bucket_type="other",
+            model_candidate="m" * 65,
+            outcome="cancelled",
+            http_status=None,
+            result_status=None,
+        ))
+
+        other_details = self.store.list_events(
+            "alice",
+            StatsFilters(model="other"),
+        )
+        known_details = self.store.list_events(
+            "alice",
+            StatsFilters(model="model-a"),
+        )
+        overview = self.store.get_overview("alice")
+        with SQLiteDatabase(self.database_path).connect() as connection:
+            persisted = {
+                row["id"]: (row["model_bucket_type"], row["model_bucket_model"])
+                for row in connection.execute(
+                    "SELECT id, model_bucket_type, model_bucket_model "
+                    "FROM usage_events ORDER BY id"
+                )
+            }
+            registered = {
+                row["model"]
+                for row in connection.execute(
+                    "SELECT model FROM usage_known_models WHERE username = 'alice'"
+                )
+            }
+            hourly = [
+                tuple(row)
+                for row in connection.execute(
+                    "SELECT model_bucket_type, model, outcome, request_count "
+                    "FROM usage_hourly ORDER BY model_bucket_type, model, outcome"
+                )
+            ]
+
+        self.assertEqual(persisted, {
+            confirmed_id: ("known", "model-a"),
+            rogue_id: ("other", ""),
+            second_rogue_id: ("other", ""),
+            known_failure_id: ("known", "model-a"),
+            overlong_id: ("other", ""),
+        })
+        self.assertEqual(registered, {"model-a"})
+        self.assertEqual(
+            hourly,
+            [
+                ("known", "model-a", "failure", 1),
+                ("known", "model-a", "success", 1),
+                ("other", "", "cancelled", 1),
+                ("other", "", "failure", 2),
+            ],
+        )
+        self.assertEqual(
+            {item["requested_model"] for item in other_details["items"]},
+            {"rogue-model", "another-rogue-model", "unknown"},
+        )
+        self.assertTrue(
+            all(
+                "model_bucket_type" not in item and "model_bucket_model" not in item
+                for item in other_details["items"]
+            )
+        )
+        self.assertEqual(known_details["total"], 2)
+        self.assertEqual(
+            {item["id"] for item in known_details["items"]},
+            {confirmed_id, known_failure_id},
+        )
+        self.assertEqual(overview["dimensions"]["models"], ["other", "model:model-a"])
+
+    def test_reserved_model_names_do_not_collide_with_special_buckets(self):
+        real_other_id = self.record(self.event(
+            requested_model="other",
+            upstream_model="other",
+            model_bucket_type="known",
+            model_bucket_model="other",
+            model_candidate="other",
+            model_known=True,
+        ))
+        real_unknown_id = self.record(self.event(
+            requested_model="unknown",
+            upstream_model="unknown",
+            model_bucket_type="known",
+            model_bucket_model="unknown",
+            model_candidate="unknown",
+            model_known=True,
+        ))
+        real_other_failure_id = self.record(self.event(
+            requested_model="other",
+            upstream_model=None,
+            model_bucket_type="other",
+            model_candidate="other",
+            outcome="failure",
+        ))
+        real_unknown_failure_id = self.record(self.event(
+            requested_model="unknown",
+            upstream_model=None,
+            model_bucket_type="other",
+            model_candidate="unknown",
+            outcome="failure",
+        ))
+        catch_all_id = self.record(self.event(
+            requested_model="rogue-model",
+            upstream_model=None,
+            model_bucket_type="other",
+            model_bucket_model=None,
+            model_candidate="rogue-model",
+            outcome="failure",
+        ))
+        unknown_id = self.record(self.event(
+            requested_model="unknown",
+            upstream_model=None,
+            model_candidate=None,
+            outcome="failure",
+        ))
+
+        overview = self.store.get_overview("alice")
+
+        self.assertEqual(
+            set(overview["dimensions"]["models"]),
+            {"model:other", "model:unknown", "other", "unknown"},
+        )
+        self.assertEqual(
+            {
+                key: {
+                    item["id"]
+                    for item in self.store.list_events(
+                        "alice",
+                        StatsFilters(model=key),
+                    )["items"]
+                }
+                for key in overview["dimensions"]["models"]
+            },
+            {
+                "model:other": {real_other_id, real_other_failure_id},
+                "model:unknown": {real_unknown_id, real_unknown_failure_id},
+                "other": {catch_all_id},
+                "unknown": {unknown_id},
+            },
+        )
+
     def test_record_event_merges_hourly_dimensions_and_preserves_null_usage(self):
         first_id = self.record(self.event())
         second_id = self.record(self.event(
@@ -341,7 +523,10 @@ class UsageStatsStoreTests(unittest.TestCase):
             [point["request_count"] for point in overview["series"]],
             [0, 1, 1, 1],
         )
-        self.assertEqual(overview["dimensions"]["models"], ["glm-5.2", "glm-5.1"])
+        self.assertEqual(
+            overview["dimensions"]["models"],
+            ["model:glm-5.2", "model:glm-5.1"],
+        )
         self.assertEqual(overview["dimensions"]["outcomes"], ["failure", "success"])
         self.assertEqual(
             overview["dimensions"]["api_keys"],
@@ -354,7 +539,10 @@ class UsageStatsStoreTests(unittest.TestCase):
                 {"id": "credential-2", "label": "Bob"},
             ],
         )
-        self.assertEqual(overview["breakdowns"]["models"][0]["model"], "glm-5.2")
+        self.assertEqual(
+            overview["breakdowns"]["models"][0]["model"],
+            "model:glm-5.2",
+        )
         self.assertEqual(overview["breakdowns"]["models"][0]["request_count"], 2)
         self.assertEqual(overview["breakdowns"]["api_keys"][0]["id"], "key-1")
         self.assertEqual(overview["breakdowns"]["credentials"][0]["id"], "credential-1")
@@ -494,8 +682,8 @@ class UsageStatsStoreTests(unittest.TestCase):
             "alice", "models", filters, search="model-2", limit=10
         )
 
-        self.assertEqual(first["items"][0]["id"], "model-24")
-        self.assertEqual(first["items"][0]["label"], "model-24")
+        self.assertEqual(first["items"][0]["id"], "model:model-24")
+        self.assertEqual(first["items"][0]["label"], "model:model-24")
         self.assertEqual(first["items"][0]["request_count"], 2)
         self.assertEqual(len(first["items"]), 10)
         self.assertIsInstance(first["next_cursor"], str)
@@ -506,7 +694,13 @@ class UsageStatsStoreTests(unittest.TestCase):
         )
         self.assertEqual(
             [item["id"] for item in searched["items"]],
-            ["model-24", "model-20", "model-21", "model-22", "model-23"],
+            [
+                "model:model-24",
+                "model:model-20",
+                "model:model-21",
+                "model:model-22",
+                "model:model-23",
+            ],
         )
         api_keys = self.store.list_dimension_values(
             "alice", "api_keys", filters, search="Production", limit=10
@@ -596,7 +790,11 @@ class UsageStatsStoreTests(unittest.TestCase):
         self.assertEqual(
             [(page["items"][0]["id"], page["items"][0]["request_count"])
              for page in (first, second, third)],
-            [("model-a", 3), ("model-b", 2), ("model-c", 1)],
+            [
+                ("model:model-a", 3),
+                ("model:model-b", 2),
+                ("model:model-c", 1),
+            ],
         )
         self.assertIsNone(third["next_cursor"])
 
@@ -631,7 +829,7 @@ class UsageStatsStoreTests(unittest.TestCase):
         )
 
         self.assertEqual(first["items"][0]["request_count"], 2)
-        self.assertEqual(second["items"][0]["id"], "model-b")
+        self.assertEqual(second["items"][0]["id"], "model:model-b")
         self.assertEqual(second["items"][0]["request_count"], 1)
         self.assertIsNone(second["next_cursor"])
 
@@ -980,7 +1178,7 @@ class UsageStatsStoreTests(unittest.TestCase):
         self.assertEqual(overview["totals"]["p95_first_output_ms"], 5000)
         self.assertEqual(overview["totals"]["p95_total_ms"], 10000)
         self.assertEqual(overview["dimensions"], {
-            "models": ["glm-5.2", "glm-5.1"],
+            "models": ["model:glm-5.2", "model:glm-5.1"],
             "api_keys": [
                 {"id": "key-1", "name": "Production"},
                 {"id": "key-2", "name": "Staging"},
@@ -993,7 +1191,7 @@ class UsageStatsStoreTests(unittest.TestCase):
         })
         self.assertEqual(
             [row["model"] for row in overview["breakdowns"]["models"]],
-            ["glm-5.2"],
+            ["model:glm-5.2"],
         )
         self.assertEqual(
             [row["id"] for row in overview["breakdowns"]["api_keys"]],
@@ -1557,17 +1755,22 @@ class UsageStatsStoreTests(unittest.TestCase):
             self.event(source="unknown"),
             self.event(outcome="unknown"),
             self.event(requested_model="  "),
+            self.event(model_known="yes"),
+            self.event(model_bucket_type="invalid"),
+            self.event(model_bucket_type="known", model_bucket_model=None),
+            self.event(model_bucket_type="other", model_bucket_model="glm-5.2"),
         ]
         for event in invalid_events:
             with self.subTest(event=event):
                 self.assertIsNone(self.record(event))
-        self.assertEqual(self.store.dropped_events, 3)
+        self.assertEqual(self.store.dropped_events, 7)
 
         invalid_filters = [
             StatsFilters(traffic="invalid"),
             StatsFilters(granularity="minute"),
             StatsFilters(timezone="Mars/Olympus"),
             StatsFilters(start_time=2, end_time=1),
+            StatsFilters(model="model:"),
         ]
         for filters in invalid_filters:
             with self.subTest(filters=filters):

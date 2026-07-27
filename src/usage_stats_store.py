@@ -47,6 +47,8 @@ _OUTCOMES = frozenset({"success", "failure", "cancelled"})
 _TRAFFIC_VALUES = frozenset({"all", "external", "admin"})
 _GRANULARITIES = frozenset({"auto", "hour", "day", "week"})
 _UNATTRIBUTED_DROPS = "\0"
+_MODEL_BUCKET_TYPES = frozenset({"known", "other", "unknown"})
+_MODEL_BUCKET_KEY_PREFIX = "model:"
 _TOKEN_FIELDS = (
     "input_tokens",
     "output_tokens",
@@ -93,6 +95,20 @@ class UsageEvent:
     requested_model: str
     occurred_at: int = field(default_factory=lambda: int(time.time()))
     upstream_model: Optional[str] = None
+    model_bucket_type: Optional[str] = None
+    model_bucket_model: Optional[str] = None
+    model_candidate: Optional[str] = field(
+        default=None,
+        repr=False,
+        compare=False,
+        metadata={"persist": False},
+    )
+    model_known: bool = field(
+        default=False,
+        repr=False,
+        compare=False,
+        metadata={"persist": False},
+    )
     api_key_id: Optional[str] = None
     api_key_name: Optional[str] = None
     credential_id: Optional[str] = None
@@ -244,6 +260,26 @@ def _clean_optional_text(value: Any, maximum: int = 200) -> Optional[str]:
     return cleaned[:maximum] or None
 
 
+def _normalize_model_filter_key(value: Any) -> Optional[str]:
+    model = _clean_optional_text(
+        value,
+        200 + len(_MODEL_BUCKET_KEY_PREFIX),
+    )
+    if model is None or model in ("other", "unknown"):
+        return model
+    if model.startswith(_MODEL_BUCKET_KEY_PREFIX):
+        if len(model) == len(_MODEL_BUCKET_KEY_PREFIX):
+            raise ValueError("model filter must include a model name")
+        return model
+    return f"{_MODEL_BUCKET_KEY_PREFIX}{model}"
+
+
+def _model_bucket_from_key(key: str) -> Tuple[str, str]:
+    if key in ("other", "unknown"):
+        return key, ""
+    return "known", key[len(_MODEL_BUCKET_KEY_PREFIX):]
+
+
 def _normalize_event(event: UsageEvent) -> UsageEvent:
     if not isinstance(event, UsageEvent):
         raise TypeError("event must be a UsageEvent")
@@ -261,6 +297,25 @@ def _normalize_event(event: UsageEvent) -> UsageEvent:
         raise ValueError("occurred_at must be a non-negative integer")
     if event.client_stream is not None and not isinstance(event.client_stream, bool):
         raise ValueError("client_stream must be a boolean or None")
+    if not isinstance(event.model_known, bool):
+        raise ValueError("model_known must be a boolean")
+    upstream_model = _clean_optional_text(event.upstream_model)
+    model_bucket_type = _clean_optional_text(event.model_bucket_type)
+    model_bucket_model = _clean_optional_text(event.model_bucket_model)
+    if model_bucket_type is None:
+        default_model = upstream_model or requested_model
+        if default_model == "unknown" and not event.model_known:
+            model_bucket_type = "unknown"
+        else:
+            model_bucket_type = "known"
+            model_bucket_model = default_model
+    if model_bucket_type not in _MODEL_BUCKET_TYPES:
+        raise ValueError(f"Unsupported model bucket type: {model_bucket_type}")
+    if model_bucket_type == "known":
+        if model_bucket_model is None:
+            raise ValueError("known model bucket must include a model")
+    elif model_bucket_model is not None:
+        raise ValueError("special model bucket must not include a model")
 
     integer_fields = (
         "http_status",
@@ -292,7 +347,10 @@ def _normalize_event(event: UsageEvent) -> UsageEvent:
         "source": source,
         "requested_model": requested_model,
         "occurred_at": occurred_at,
-        "upstream_model": _clean_optional_text(event.upstream_model),
+        "upstream_model": upstream_model,
+        "model_bucket_type": model_bucket_type,
+        "model_bucket_model": model_bucket_model or "",
+        "model_candidate": _clean_optional_text(event.model_candidate),
         "api_key_id": _clean_optional_text(event.api_key_id),
         "api_key_name": _clean_optional_text(event.api_key_name),
         "credential_id": _clean_optional_text(event.credential_id),
@@ -341,7 +399,7 @@ def _coerce_filters(filters: Union[StatsFilters, Mapping[str, Any], None]) -> Tu
         filters,
         start_time=start_time,
         end_time=end_time,
-        model=_clean_optional_text(filters.model),
+        model=_normalize_model_filter_key(filters.model),
         api_key_id=_clean_optional_text(filters.api_key_id),
         credential_id=_clean_optional_text(filters.credential_id),
     )
@@ -394,15 +452,19 @@ class UsageStatsStore:
             return None
 
     def _record_event(self, event: UsageEvent, username: str) -> int:
-        detail = asdict(event)
-        event_columns = tuple(detail)
-        detail["username"] = username
-        detail["client_stream"] = (
-            None if event.client_stream is None else int(event.client_stream)
-        )
-        columns = ("username",) + event_columns
-        placeholders = ", ".join(f":{name}" for name in columns)
         with self._database().connect(create=False) as connection:
+            event = self._resolve_model_bucket(connection, username, event)
+            self._register_known_model(connection, username, event)
+            detail = asdict(event)
+            for transient_field in ("model_candidate", "model_known"):
+                detail.pop(transient_field)
+            event_columns = tuple(detail)
+            detail["username"] = username
+            detail["client_stream"] = (
+                None if event.client_stream is None else int(event.client_stream)
+            )
+            columns = ("username",) + event_columns
+            placeholders = ", ".join(f":{name}" for name in columns)
             cursor = connection.execute(
                 f"INSERT INTO usage_events ({', '.join(columns)}) VALUES ({placeholders})",
                 detail,
@@ -415,6 +477,41 @@ class UsageStatsStore:
                     connection, hourly_id, "first_output", event.first_output_ms
                 )
         return event_id
+
+    @staticmethod
+    def _resolve_model_bucket(connection, username: str, event: UsageEvent) -> UsageEvent:
+        if event.model_bucket_type != "other" or event.model_candidate is None:
+            return event
+        candidates = tuple(dict.fromkeys((
+            event.model_candidate,
+            event.model_candidate.rsplit("/", 1)[-1],
+        )))
+        placeholders = ", ".join("?" for _ in candidates)
+        row = connection.execute(
+            "SELECT model FROM usage_known_models "
+            f"WHERE username = ? AND model IN ({placeholders}) "
+            "ORDER BY CASE WHEN model = ? THEN 0 ELSE 1 END LIMIT 1",
+            (username, *candidates, event.model_candidate),
+        ).fetchone()
+        if row is None:
+            return event
+        return replace(
+            event,
+            model_bucket_type="known",
+            model_bucket_model=str(row["model"]),
+        )
+
+    @staticmethod
+    def _register_known_model(connection, username: str, event: UsageEvent) -> None:
+        if (
+                event.model_bucket_type != "known"
+                or not (event.model_known or event.outcome == "success")
+        ):
+            return
+        connection.execute(
+            "INSERT OR IGNORE INTO usage_known_models(username, model) VALUES (?, ?)",
+            (username, event.model_bucket_model),
+        )
 
     @staticmethod
     def _cleanup_in_connection(connection, now: int) -> int:
@@ -441,7 +538,8 @@ class UsageStatsStore:
             "username": username,
             "hour": event.occurred_at // 3600 * 3600,
             "source": event.source,
-            "model": event.upstream_model or event.requested_model,
+            "model_bucket_type": event.model_bucket_type,
+            "model": event.model_bucket_model,
             "api_key_id": event.api_key_id or "",
             "api_key_name": event.api_key_name or "",
             "credential_id": event.credential_id or "",
@@ -464,8 +562,9 @@ class UsageStatsStore:
         values = cls._hourly_values(username, event)
 
         dimensions = (
-            "username", "hour", "source", "model", "api_key_id", "api_key_name",
-            "credential_id", "credential_label", "outcome",
+            "username", "hour", "source", "model_bucket_type", "model",
+            "api_key_id", "api_key_name", "credential_id", "credential_label",
+            "outcome",
         )
         counters = tuple(name for name in values if name not in dimensions)
         columns = dimensions + counters
@@ -474,8 +573,9 @@ class UsageStatsStore:
             INSERT INTO usage_hourly ({', '.join(columns)})
             VALUES ({', '.join(f':{name}' for name in columns)})
             ON CONFLICT (
-                username, hour, source, model, api_key_id, api_key_name,
-                credential_id, credential_label, outcome
+                username, hour, source, model_bucket_type, model,
+                api_key_id, api_key_name, credential_id, credential_label,
+                outcome
             ) DO UPDATE SET
                 {', '.join(f'{name} = {name} + excluded.{name}' for name in counters)}
             """,
@@ -529,15 +629,19 @@ class UsageStatsStore:
             clauses.append(
                 f"{source_column} IN ('admin_playground', 'credential_test')"
             )
-        model_column = f"{prefix}model" if hourly else (
-            "COALESCE(NULLIF(upstream_model, ''), requested_model)"
-        )
         filter_columns = {
-            "model": model_column,
             "api_key_id": f"{prefix}api_key_id",
             "credential_id": f"{prefix}credential_id",
             "outcome": f"{prefix}outcome",
         }
+        if filters.model is not None:
+            bucket_type, bucket_model = _model_bucket_from_key(filters.model)
+            clauses.append(f"{prefix}model_bucket_type = :model_bucket_type")
+            parameters["model_bucket_type"] = bucket_type
+            if bucket_type == "known":
+                model_column = f"{prefix}model" if hourly else "model_bucket_model"
+                clauses.append(f"{model_column} = :model_bucket_model")
+                parameters["model_bucket_model"] = bucket_model
         for name, column in filter_columns.items():
             value = getattr(filters, name)
             if value is not None:
@@ -671,6 +775,14 @@ class UsageStatsStore:
             for index, upper_bound in enumerate(LATENCY_BUCKET_UPPER_BOUNDS_MS)
         )
         return f"CASE {clauses} ELSE {len(LATENCY_BUCKET_UPPER_BOUNDS_MS)} END"
+
+    @staticmethod
+    def _model_bucket_sql(bucket_type_column: str, model_column: str) -> str:
+        return (
+            f"CASE WHEN {bucket_type_column} = 'known' "
+            f"THEN '{_MODEL_BUCKET_KEY_PREFIX}' || {model_column} "
+            f"ELSE {bucket_type_column} END"
+        )
 
     @staticmethod
     def _aggregate_select(alias: str = "") -> str:
@@ -827,6 +939,10 @@ class UsageStatsStore:
                 hourly_parameters[key] = hour
                 placeholders.append(f":{key}")
             excluded = f" AND h.hour NOT IN ({', '.join(placeholders)})"
+        hourly_model_expression = cls._model_bucket_sql(
+            "h.model_bucket_type",
+            "h.model",
+        )
         connection.execute(
             """
             INSERT INTO stats_base (
@@ -840,7 +956,8 @@ class UsageStatsStore:
                 cache_miss_tokens_known_count, credit_sum, credit_known_count
             )
             SELECT
-                h.hour, h.hour, h.source, h.model, h.api_key_id, h.api_key_name,
+                h.hour, h.hour, h.source, """ + hourly_model_expression + """,
+                h.api_key_id, h.api_key_name,
                 h.credential_id, h.credential_label, h.outcome, h.request_count,
                 h.success_count, h.usage_known_count, h.input_tokens_sum,
                 h.input_tokens_known_count, h.output_tokens_sum,
@@ -859,7 +976,8 @@ class UsageStatsStore:
                 metric, bucket_index, sample_count
             )
             SELECT
-                h.hour, h.model, h.api_key_id, h.credential_id, h.outcome,
+                h.hour, """ + hourly_model_expression + """,
+                h.api_key_id, h.credential_id, h.outcome,
                 l.metric, l.bucket_index, l.sample_count
             FROM usage_latency_histogram l
             JOIN usage_hourly h ON h.id = l.hourly_id
@@ -893,7 +1011,10 @@ class UsageStatsStore:
         if snapshot_event_id is not None:
             detail_where += " AND id <= :snapshot_event_id"
             detail_parameters["snapshot_event_id"] = snapshot_event_id
-        model_expression = "COALESCE(NULLIF(upstream_model, ''), requested_model)"
+        model_expression = cls._model_bucket_sql(
+            "model_bucket_type",
+            "model_bucket_model",
+        )
         connection.execute(
             """
             INSERT INTO stats_base (
@@ -989,7 +1110,10 @@ class UsageStatsStore:
                 f"NOT IN ({', '.join(placeholders)})"
             )
 
-        model_expression = "COALESCE(NULLIF(upstream_model, ''), requested_model)"
+        model_expression = cls._model_bucket_sql(
+            "model_bucket_type",
+            "model_bucket_model",
+        )
         connection.execute(
             """
             INSERT INTO stats_base (
@@ -1936,6 +2060,8 @@ class UsageStatsStore:
         item = dict(row)
         item["started_at"] = item.pop("occurred_at")
         item.pop("username")
+        item.pop("model_bucket_type")
+        item.pop("model_bucket_model")
         if item["client_stream"] is not None:
             item["client_stream"] = bool(item["client_stream"])
         return item

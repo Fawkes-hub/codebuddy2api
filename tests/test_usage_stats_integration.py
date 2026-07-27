@@ -258,16 +258,32 @@ class UsageStatsIntegrationTests(TempConfigMixin, unittest.IsolatedAsyncioTestCa
             "/api/admin/stats/requests",
             session=True,
         )
+        overview = await self._request(
+            "GET",
+            "/api/admin/stats/overview",
+            session=True,
+        )
+        other_details = await self._request(
+            "GET",
+            "/api/admin/stats/requests?model=other",
+            session=True,
+        )
 
         self.assertEqual(response.status_code, 401)
         event = details.json()["items"][0]
-        self.assertEqual(event["requested_model"], "unknown")
+        self.assertEqual(event["requested_model"], "provider/model-a")
         self.assertIs(event["client_stream"], True)
         self.assertEqual(event["message_count"], 1)
         self.assertEqual(event["tool_count"], 1)
         self.assertIsNone(event["upstream_model"])
         self.assertNotIn("private prompt", str(event))
         self.assertNotIn("tool definition", str(event))
+        self.assertEqual(overview.json()["dimensions"]["models"], ["other"])
+        self.assertEqual(other_details.json()["total"], 1)
+        self.assertEqual(
+            other_details.json()["items"][0]["requested_model"],
+            "provider/model-a",
+        )
 
     async def test_object_model_cannot_reenter_stats_after_request_preparation(self):
         with (

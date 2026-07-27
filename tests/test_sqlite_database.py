@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from src import sqlite_database as sqlite_database_module
 from src.sqlite_database import DATABASE_FILENAME, SQLiteDatabase, resolve_database_path
 from src.user_settings_schema import coerce_user_setting, sanitize_user_settings
 from src.user_settings_store import UserSettingsStore
@@ -45,7 +46,7 @@ class SQLiteDatabaseTests(unittest.TestCase):
                 if path.name != DATABASE_FILENAME
             }
 
-        self.assertEqual(version, 3)
+        self.assertEqual(version, 4)
         self.assertTrue({
             "api_keys",
             "user_settings",
@@ -53,6 +54,7 @@ class SQLiteDatabaseTests(unittest.TestCase):
             "usage_hourly",
             "usage_latency_histogram",
             "usage_retention_state",
+            "usage_known_models",
             "credential_daily_checkins",
         }.issubset(tables))
         with sqlite3.connect(database_path) as connection:
@@ -167,25 +169,29 @@ class SQLiteDatabaseTests(unittest.TestCase):
                 )
             }
 
-        self.assertEqual(version, 3)
+        self.assertEqual(version, 4)
         self.assertEqual(value, "true")
         self.assertTrue({
             "usage_events",
             "usage_hourly",
             "usage_latency_histogram",
             "usage_retention_state",
+            "usage_known_models",
             "credential_daily_checkins",
         }.issubset(tables))
 
     def test_connection_atomically_migrates_v2_and_preserves_existing_rows(self):
         database = SQLiteDatabase(self.database_path)
-        with database.connect() as connection:
+        with sqlite3.connect(self.database_path) as connection:
+            for statement in (
+                    sqlite_database_module._SCHEMA_V1_STATEMENTS
+                    + sqlite_database_module._SCHEMA_V2_STATEMENTS
+            ):
+                connection.execute(statement)
             connection.execute(
                 "INSERT INTO user_settings VALUES (?, ?, ?)",
                 ("alice", "enabled", "true"),
             )
-        with sqlite3.connect(self.database_path) as connection:
-            connection.execute("DROP TABLE credential_daily_checkins")
             connection.execute("PRAGMA user_version = 2")
 
         with database.connect() as connection:
@@ -198,9 +204,177 @@ class SQLiteDatabaseTests(unittest.TestCase):
                 "AND name = 'credential_daily_checkins'"
             ).fetchone()
 
-        self.assertEqual(version, 3)
+        self.assertEqual(version, 4)
         self.assertEqual(value, "true")
         self.assertIsNotNone(checkin_table)
+
+    def test_v3_migration_preserves_unknown_and_merges_unrecognized_model_buckets(self):
+        with sqlite3.connect(self.database_path) as connection:
+            for statement in (
+                    sqlite_database_module._SCHEMA_V1_STATEMENTS
+                    + sqlite_database_module._SCHEMA_V2_STATEMENTS
+                    + sqlite_database_module._SCHEMA_V3_STATEMENTS
+            ):
+                connection.execute(statement)
+            connection.executemany(
+                """
+                INSERT INTO usage_events(
+                    username, occurred_at, source, requested_model,
+                    upstream_model, outcome
+                ) VALUES (?, ?, 'external_api', ?, ?, ?)
+                """,
+                [
+                    ("alice", 100, "model-a", "model-a", "success"),
+                    ("alice", 101, "model-a", None, "failure"),
+                    ("alice", 102, "rogue-one", None, "failure"),
+                    ("alice", 103, "rogue-two", None, "failure"),
+                    ("alice", 104, "unknown", None, "failure"),
+                    ("alice", 105, "unknown", None, "cancelled"),
+                    ("alice", 106, "other", "other", "success"),
+                    ("alice", 107, "other", None, "failure"),
+                ],
+            )
+            connection.executemany(
+                """
+                INSERT INTO usage_hourly(
+                    username, hour, source, model, api_key_id, api_key_name,
+                    credential_id, credential_label, outcome, request_count,
+                    success_count, failure_count, cancelled_count,
+                    total_tokens_sum, total_tokens_known_count
+                ) VALUES (
+                    'alice', 0, 'external_api', ?, '', '', '', '', ?, ?,
+                    ?, ?, ?, ?, ?
+                )
+                """,
+                [
+                    ("model-a", "success", 1, 1, 0, 0, 10, 1),
+                    ("model-a", "failure", 1, 0, 1, 0, 20, 1),
+                    ("rogue-one", "failure", 2, 0, 2, 0, 30, 2),
+                    ("rogue-two", "failure", 3, 0, 3, 0, 40, 3),
+                    ("unknown", "failure", 4, 0, 4, 0, 50, 4),
+                    ("unknown", "cancelled", 5, 0, 0, 5, 60, 5),
+                    ("other", "success", 1, 1, 0, 0, 7, 1),
+                    ("other", "failure", 1, 0, 1, 0, 8, 1),
+                ],
+            )
+            connection.executemany(
+                """
+                INSERT INTO usage_latency_histogram(
+                    hourly_id, metric, bucket_index, sample_count
+                ) VALUES (?, 'total', ?, ?)
+                """,
+                [(1, 1, 2), (3, 2, 3), (4, 2, 4)],
+            )
+            connection.execute("PRAGMA user_version = 3")
+
+        with SQLiteDatabase(self.database_path).connect() as connection:
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            event_buckets = [
+                tuple(row)
+                for row in connection.execute(
+                    "SELECT requested_model, outcome, "
+                    "model_bucket_type, model_bucket_model "
+                    "FROM usage_events ORDER BY id"
+                )
+            ]
+            hourly = [
+                tuple(row)
+                for row in connection.execute(
+                    "SELECT model_bucket_type, model, outcome, request_count, "
+                    "total_tokens_sum FROM usage_hourly "
+                    "ORDER BY model_bucket_type, model, outcome"
+                )
+            ]
+            histograms = [
+                tuple(row)
+                for row in connection.execute(
+                    "SELECT hourly.model_bucket_type, hourly.model, hourly.outcome, "
+                    "histogram.bucket_index, histogram.sample_count "
+                    "FROM usage_latency_histogram histogram "
+                    "JOIN usage_hourly hourly ON hourly.id = histogram.hourly_id "
+                    "ORDER BY hourly.model_bucket_type, hourly.model, hourly.outcome"
+                )
+            ]
+            known_models = [
+                tuple(row)
+                for row in connection.execute(
+                    "SELECT username, model FROM usage_known_models"
+                )
+            ]
+            totals = tuple(connection.execute(
+                "SELECT SUM(request_count), SUM(total_tokens_sum) FROM usage_hourly"
+            ).fetchone())
+
+        self.assertEqual(version, 4)
+        self.assertEqual(event_buckets, [
+            ("model-a", "success", "known", "model-a"),
+            ("model-a", "failure", "known", "model-a"),
+            ("rogue-one", "failure", "other", ""),
+            ("rogue-two", "failure", "other", ""),
+            ("unknown", "failure", "unknown", ""),
+            ("unknown", "cancelled", "unknown", ""),
+            ("other", "success", "known", "other"),
+            ("other", "failure", "known", "other"),
+        ])
+        self.assertEqual(hourly, [
+            ("known", "model-a", "failure", 1, 20),
+            ("known", "model-a", "success", 1, 10),
+            ("known", "other", "failure", 1, 8),
+            ("known", "other", "success", 1, 7),
+            ("other", "", "failure", 5, 70),
+            ("unknown", "", "cancelled", 5, 60),
+            ("unknown", "", "failure", 4, 50),
+        ])
+        self.assertEqual(histograms, [
+            ("known", "model-a", "success", 1, 2),
+            ("other", "", "failure", 2, 7),
+        ])
+        self.assertEqual(known_models, [("alice", "model-a"), ("alice", "other")])
+        self.assertEqual(totals, (18, 225))
+
+    def test_v3_model_bucket_migration_rolls_back_schema_and_data_on_failure(self):
+        with sqlite3.connect(self.database_path) as connection:
+            for statement in (
+                    sqlite_database_module._SCHEMA_V1_STATEMENTS
+                    + sqlite_database_module._SCHEMA_V2_STATEMENTS
+                    + sqlite_database_module._SCHEMA_V3_STATEMENTS
+            ):
+                connection.execute(statement)
+            connection.execute(
+                "INSERT INTO usage_events("
+                "username, occurred_at, source, requested_model, outcome"
+                ") VALUES ('alice', 1, 'external_api', 'rogue', 'failure')"
+            )
+            connection.execute("PRAGMA user_version = 3")
+
+        with sqlite3.connect(self.database_path) as connection:
+            def deny_event_backfill(action, argument, *_args):
+                if action == sqlite3.SQLITE_UPDATE and argument == "usage_events":
+                    return sqlite3.SQLITE_DENY
+                return sqlite3.SQLITE_OK
+
+            connection.set_authorizer(deny_event_backfill)
+            with self.assertRaises(sqlite3.DatabaseError):
+                SQLiteDatabase(self.database_path)._initialize_schema(connection)
+            connection.set_authorizer(None)
+
+            version = connection.execute("PRAGMA user_version").fetchone()[0]
+            columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(usage_events)")
+            }
+            known_models_table = connection.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'usage_known_models'"
+            ).fetchone()
+            requested_model = connection.execute(
+                "SELECT requested_model FROM usage_events"
+            ).fetchone()[0]
+
+        self.assertEqual(version, 3)
+        self.assertNotIn("model_bucket_type", columns)
+        self.assertNotIn("model_bucket_model", columns)
+        self.assertIsNone(known_models_table)
+        self.assertEqual(requested_model, "rogue")
 
     def test_v1_migration_rolls_back_all_new_objects_when_ddl_fails(self):
         with sqlite3.connect(self.database_path) as connection:

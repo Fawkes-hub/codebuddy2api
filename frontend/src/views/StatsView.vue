@@ -295,12 +295,24 @@ function filterOptions(
   return result;
 }
 
+function modelBucketLabel(model: string): string {
+  if (model === 'other') return '其他';
+  if (model === 'unknown') return '未知';
+  return model.startsWith('model:') ? model.slice('model:'.length) : model;
+}
+
 const modelOptions = computed(() =>
   filterOptions(
     '全部模型',
-    (dimensions.value?.models ?? []).map((model) => ({ value: model, label: model })),
+    (dimensions.value?.models ?? []).map((model) => ({
+      value: model,
+      label: modelBucketLabel(model),
+    })),
     filters.model,
-  ),
+  ).map((option) => ({
+    ...option,
+    label: option.value ? modelBucketLabel(option.value) : option.label,
+  })),
 );
 const apiKeyOptions = computed(() =>
   filterOptions(
@@ -626,7 +638,10 @@ async function loadDimensionPage(
       limit: DIMENSION_PAGE_SIZE,
     });
     if (generation !== dimensionRequestGeneration) return false;
-    dimensionItems.value = page.items;
+    dimensionItems.value =
+      kind === 'models'
+        ? page.items.map((item) => ({ ...item, label: modelBucketLabel(item.id) }))
+        : page.items;
     dimensionCursor.value = cursor;
     dimensionNextCursor.value = page.next_cursor;
     return true;
@@ -711,7 +726,11 @@ function breakdownRows(kind: 'models' | 'api_keys' | 'credentials'): RankingRow[
   const data = breakdowns.value;
   if (!data) return [];
   if (kind === 'models') {
-    return data.models.map((row) => ({ ...row, id: row.model, label: row.model }));
+    return data.models.map((row) => ({
+      ...row,
+      id: row.model,
+      label: modelBucketLabel(row.model),
+    }));
   }
   if (kind === 'api_keys') {
     return data.api_keys.map((row) => ({ ...row, label: row.name }));

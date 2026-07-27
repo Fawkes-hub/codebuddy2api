@@ -208,7 +208,9 @@ class UsageStatsContextTests(unittest.TestCase):
 
         event = store.events[0]
         self.assertEqual(event.request_bytes, 17)
-        self.assertEqual(event.requested_model, "unknown")
+        self.assertEqual(event.requested_model, "client/model")
+        self.assertEqual(event.model_bucket_type, "other")
+        self.assertIsNone(event.model_bucket_model)
         self.assertIsNone(event.upstream_model)
         self.assertIs(event.client_stream, True)
         self.assertEqual(event.message_count, 0)
@@ -332,6 +334,60 @@ class UsageStatsContextTests(unittest.TestCase):
                 self.assertEqual(event.error_type, expected_type)
                 self.assertEqual(event.result_status, expected_status)
 
+    def test_cancelled_requests_apply_same_64_character_model_limit(self):
+        for length, expected_model in ((64, "m" * 64), (65, "unknown")):
+            with self.subTest(length=length):
+                store = FakeStore()
+                context = UsageStatsContext(
+                    AuthenticatedUser("admin", "session_cookie"),
+                    "admin_playground",
+                    store=store,
+                    known_models=(),
+                    monotonic_factory=mock.Mock(side_effect=[1.0, 1.1]),
+                )
+                context.capture_request_shape({"model": "m" * length})
+                context.complete_response(
+                    http_status=200,
+                    response_bytes=0,
+                    client_disconnected=True,
+                )
+
+                event = store.events[0]
+                self.assertEqual(event.outcome, "cancelled")
+                self.assertEqual(event.requested_model, expected_model)
+                self.assertEqual(event.model_bucket_type, "other")
+                self.assertIsNone(event.model_bucket_model)
+
+    def test_failed_and_cancelled_requests_reject_api_key_shaped_models(self):
+        api_key = f"sk-{'A' * 54}"
+        cases = (
+            (400, False, "failure"),
+            (200, True, "cancelled"),
+        )
+        for http_status, client_disconnected, expected_outcome in cases:
+            with self.subTest(expected_outcome=expected_outcome):
+                store = FakeStore()
+                context = UsageStatsContext(
+                    AuthenticatedUser("admin", "session_cookie"),
+                    "admin_playground",
+                    store=store,
+                    known_models=(),
+                    monotonic_factory=mock.Mock(side_effect=[1.0, 1.1]),
+                )
+                context.capture_request_shape({"model": api_key})
+                context.complete_response(
+                    http_status=http_status,
+                    response_bytes=0,
+                    client_disconnected=client_disconnected,
+                )
+
+                event = store.events[0]
+                self.assertEqual(event.outcome, expected_outcome)
+                self.assertEqual(event.requested_model, "unknown")
+                self.assertEqual(event.model_bucket_type, "unknown")
+                self.assertIsNone(event.model_bucket_model)
+                self.assertIsNone(event.model_candidate)
+
     def test_failure_error_type_is_restricted_to_controlled_categories(self):
         cases = [
             ("validation_error", 422, "validation_error"),
@@ -409,7 +465,7 @@ class UsageStatsContextTests(unittest.TestCase):
         )
         self.assertIsNone(without_thinking._store.events[0].thinking_mode)
 
-    def test_arbitrary_models_are_unknown_until_a_successful_upstream_confirmation(self):
+    def test_failed_requests_record_safe_model_unless_it_exceeds_64_characters(self):
         failed_store = FakeStore()
         failed = UsageStatsContext(
             AuthenticatedUser("admin", "session_cookie"),
@@ -421,6 +477,40 @@ class UsageStatsContextTests(unittest.TestCase):
         failed.capture_request_shape({"model": "sk-token-shaped-model"})
         failed.capture_prepared_request({"model": "sk-token-shaped-model"})
         failed.complete_response(http_status=400, response_bytes=0, client_disconnected=False)
+
+        boundary_store = FakeStore()
+        boundary = UsageStatsContext(
+            AuthenticatedUser("admin", "session_cookie"),
+            "admin_playground",
+            store=boundary_store,
+            known_models=("configured-model",),
+            monotonic_factory=mock.Mock(side_effect=[1.0, 1.1]),
+        )
+        boundary.capture_request_shape({"model": "m" * 64})
+        boundary.complete_response(http_status=400, response_bytes=0, client_disconnected=False)
+
+        overlong_store = FakeStore()
+        overlong = UsageStatsContext(
+            AuthenticatedUser("admin", "session_cookie"),
+            "admin_playground",
+            store=overlong_store,
+            known_models=("configured-model",),
+            monotonic_factory=mock.Mock(side_effect=[1.0, 1.1]),
+        )
+        overlong.capture_request_shape({"model": "m" * 65})
+        overlong.complete_response(http_status=400, response_bytes=0, client_disconnected=False)
+
+        prepared_store = FakeStore()
+        prepared = UsageStatsContext(
+            AuthenticatedUser("admin", "session_cookie"),
+            "admin_playground",
+            store=prepared_store,
+            known_models=("prepared-model",),
+            monotonic_factory=mock.Mock(side_effect=[1.0, 1.1]),
+        )
+        prepared.capture_request_shape({"model": "client-alias"})
+        prepared.capture_prepared_request({"model": "prepared-model"})
+        prepared.complete_response(http_status=400, response_bytes=0, client_disconnected=False)
 
         successful_store = FakeStore()
         successful = UsageStatsContext(
@@ -455,12 +545,51 @@ class UsageStatsContextTests(unittest.TestCase):
         known.capture_prepared_request({"model": "configured-model"})
         known.complete_response(http_status=422, response_bytes=0, client_disconnected=False)
 
-        self.assertEqual(failed_store.events[0].requested_model, "unknown")
+        self.assertEqual(failed_store.events[0].requested_model, "sk-token-shaped-model")
+        self.assertEqual(failed_store.events[0].model_bucket_type, "other")
+        self.assertIsNone(failed_store.events[0].model_bucket_model)
         self.assertIsNone(failed_store.events[0].upstream_model)
+        self.assertEqual(boundary_store.events[0].requested_model, "m" * 64)
+        self.assertEqual(boundary_store.events[0].model_bucket_type, "other")
+        self.assertIsNone(boundary_store.events[0].model_bucket_model)
+        self.assertEqual(overlong_store.events[0].requested_model, "unknown")
+        self.assertEqual(overlong_store.events[0].model_bucket_type, "other")
+        self.assertIsNone(overlong_store.events[0].model_bucket_model)
+        self.assertEqual(prepared_store.events[0].requested_model, "prepared-model")
+        self.assertEqual(prepared_store.events[0].upstream_model, "prepared-model")
+        self.assertEqual(prepared_store.events[0].model_bucket_type, "known")
+        self.assertEqual(prepared_store.events[0].model_bucket_model, "prepared-model")
         self.assertEqual(successful_store.events[0].requested_model, "dynamic-model")
+        self.assertEqual(successful_store.events[0].model_bucket_type, "known")
+        self.assertEqual(successful_store.events[0].model_bucket_model, "dynamic-model")
         self.assertEqual(successful_store.events[0].upstream_model, "dynamic-model")
         self.assertEqual(known_store.events[0].requested_model, "configured-model")
+        self.assertEqual(known_store.events[0].model_bucket_type, "known")
+        self.assertEqual(known_store.events[0].model_bucket_model, "configured-model")
         self.assertEqual(known_store.events[0].upstream_model, "configured-model")
+
+    def test_success_preserves_configured_unknown_as_a_known_model_without_upstream_model(self):
+        store = FakeStore()
+        context = UsageStatsContext(
+            AuthenticatedUser("admin", "session_cookie"),
+            "admin_playground",
+            store=store,
+            known_models=("unknown",),
+            monotonic_factory=mock.Mock(side_effect=[1.0, 1.1]),
+        )
+        context.capture_request_shape({"model": "unknown"})
+        context.complete_response(
+            http_status=200,
+            response_bytes=1,
+            client_disconnected=False,
+        )
+
+        event = store.events[0]
+        self.assertEqual(event.requested_model, "unknown")
+        self.assertIsNone(event.upstream_model)
+        self.assertEqual(event.model_bucket_type, "known")
+        self.assertEqual(event.model_bucket_model, "unknown")
+        self.assertTrue(event.model_known)
 
     def test_trusted_model_confirmation_rejects_invalid_values_and_canonicalizes_namespaces(self):
         unknown_store = FakeStore()

@@ -9,7 +9,7 @@ from typing import Iterator, Union
 from urllib.parse import quote
 
 DATABASE_FILENAME = "codebuddy2api.sqlite3"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _SCHEMA_LOCK = threading.RLock()
 _SCHEMA_V1_STATEMENTS = (
@@ -171,6 +171,230 @@ _SCHEMA_V3_STATEMENTS = (
     """,
 )
 
+_SCHEMA_V4_STATEMENTS = (
+    """
+    ALTER TABLE usage_events
+    ADD COLUMN model_bucket_type TEXT NOT NULL DEFAULT 'unknown'
+    CHECK (model_bucket_type IN ('known', 'other', 'unknown'))
+    """,
+    """
+    ALTER TABLE usage_events
+    ADD COLUMN model_bucket_model TEXT NOT NULL DEFAULT ''
+    """,
+    """
+    CREATE TABLE usage_known_models (
+        username TEXT NOT NULL,
+        model TEXT NOT NULL,
+        PRIMARY KEY (username, model)
+    ) WITHOUT ROWID
+    """,
+)
+
+
+def _migrate_usage_model_buckets(connection: sqlite3.Connection) -> None:
+    """迁移历史模型维度；桶类型与真实模型名分离，既有 unknown 保持不变。"""
+    effective_event_model = "COALESCE(NULLIF(upstream_model, ''), requested_model)"
+    connection.execute(
+        """
+        INSERT OR IGNORE INTO usage_known_models(username, model)
+        SELECT username, model
+        FROM usage_hourly
+        WHERE outcome = 'success' AND model <> 'unknown'
+        """
+    )
+    connection.execute(
+        f"""
+        UPDATE usage_events
+        SET model_bucket_type = CASE
+            WHEN {effective_event_model} = 'unknown' THEN 'unknown'
+            WHEN outcome = 'success' THEN 'known'
+            WHEN EXISTS (
+                SELECT 1
+                FROM usage_known_models known
+                WHERE known.username = usage_events.username
+                  AND known.model = {effective_event_model}
+            ) THEN 'known'
+            ELSE 'other'
+        END
+        """
+    )
+    connection.execute(
+        f"""
+        UPDATE usage_events
+        SET model_bucket_model = CASE
+            WHEN model_bucket_type = 'known' THEN {effective_event_model}
+            ELSE ''
+        END
+        """
+    )
+
+    old_dimensions = (
+        "username",
+        "hour",
+        "source",
+        "model",
+        "api_key_id",
+        "api_key_name",
+        "credential_id",
+        "credential_label",
+        "outcome",
+    )
+    old_columns = tuple(
+        row[1]
+        for row in connection.execute("PRAGMA table_info(usage_hourly)")
+        if row[1] != "id"
+    )
+    counters = tuple(name for name in old_columns if name not in old_dimensions)
+    migrated_type = (
+        "CASE "
+        "WHEN h.model = 'unknown' THEN 'unknown' "
+        "WHEN h.outcome = 'success' THEN 'known' "
+        "WHEN EXISTS ("
+        "SELECT 1 FROM usage_known_models known "
+        "WHERE known.username = h.username AND known.model = h.model"
+        ") THEN 'known' "
+        "ELSE 'other' END"
+    )
+    migrated_model = (
+        "CASE "
+        f"WHEN ({migrated_type}) = 'known' THEN h.model "
+        "ELSE '' END"
+    )
+    grouped_dimensions = (
+        "h.username",
+        "h.hour",
+        "h.source",
+        migrated_type,
+        migrated_model,
+        "h.api_key_id",
+        "h.api_key_name",
+        "h.credential_id",
+        "h.credential_label",
+        "h.outcome",
+    )
+    connection.execute(
+        """
+        CREATE TABLE usage_hourly_v4 (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            hour INTEGER NOT NULL,
+            source TEXT NOT NULL,
+            model_bucket_type TEXT NOT NULL CHECK (
+                model_bucket_type IN ('known', 'other', 'unknown')
+            ),
+            model TEXT NOT NULL,
+            api_key_id TEXT NOT NULL,
+            api_key_name TEXT NOT NULL,
+            credential_id TEXT NOT NULL,
+            credential_label TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            request_count INTEGER NOT NULL DEFAULT 0,
+            success_count INTEGER NOT NULL DEFAULT 0,
+            failure_count INTEGER NOT NULL DEFAULT 0,
+            cancelled_count INTEGER NOT NULL DEFAULT 0,
+            usage_known_count INTEGER NOT NULL DEFAULT 0,
+            input_tokens_sum INTEGER NOT NULL DEFAULT 0,
+            input_tokens_known_count INTEGER NOT NULL DEFAULT 0,
+            output_tokens_sum INTEGER NOT NULL DEFAULT 0,
+            output_tokens_known_count INTEGER NOT NULL DEFAULT 0,
+            total_tokens_sum INTEGER NOT NULL DEFAULT 0,
+            total_tokens_known_count INTEGER NOT NULL DEFAULT 0,
+            reasoning_tokens_sum INTEGER NOT NULL DEFAULT 0,
+            reasoning_tokens_known_count INTEGER NOT NULL DEFAULT 0,
+            cache_hit_tokens_sum INTEGER NOT NULL DEFAULT 0,
+            cache_hit_tokens_known_count INTEGER NOT NULL DEFAULT 0,
+            cache_miss_tokens_sum INTEGER NOT NULL DEFAULT 0,
+            cache_miss_tokens_known_count INTEGER NOT NULL DEFAULT 0,
+            cache_write_tokens_sum INTEGER NOT NULL DEFAULT 0,
+            cache_write_tokens_known_count INTEGER NOT NULL DEFAULT 0,
+            credit_sum REAL NOT NULL DEFAULT 0,
+            credit_known_count INTEGER NOT NULL DEFAULT 0,
+            request_bytes_sum INTEGER NOT NULL DEFAULT 0,
+            request_bytes_known_count INTEGER NOT NULL DEFAULT 0,
+            response_bytes_sum INTEGER NOT NULL DEFAULT 0,
+            response_bytes_known_count INTEGER NOT NULL DEFAULT 0,
+            retry_count_sum INTEGER NOT NULL DEFAULT 0,
+            retry_count_known_count INTEGER NOT NULL DEFAULT 0,
+            tool_call_count_sum INTEGER NOT NULL DEFAULT 0,
+            tool_call_count_known_count INTEGER NOT NULL DEFAULT 0,
+            UNIQUE (
+                username, hour, source, model_bucket_type, model,
+                api_key_id, api_key_name, credential_id, credential_label, outcome
+            )
+        )
+        """
+    )
+    connection.execute(
+        f"""
+        INSERT INTO usage_hourly_v4 (
+            id, username, hour, source, model_bucket_type, model,
+            api_key_id, api_key_name, credential_id, credential_label, outcome,
+            {', '.join(counters)}
+        )
+        SELECT
+            MIN(h.id), h.username, h.hour, h.source,
+            {migrated_type}, {migrated_model},
+            h.api_key_id, h.api_key_name, h.credential_id, h.credential_label,
+            h.outcome,
+            {', '.join(f'SUM(h.{name})' for name in counters)}
+        FROM usage_hourly h
+        GROUP BY {', '.join(grouped_dimensions)}
+        """
+    )
+    connection.execute(
+        f"""
+        CREATE TEMP TABLE usage_hourly_v4_mapping AS
+        SELECT h.id AS old_id, migrated.id AS new_id
+        FROM usage_hourly h
+        JOIN usage_hourly_v4 migrated
+          ON migrated.username = h.username
+         AND migrated.hour = h.hour
+         AND migrated.source = h.source
+         AND migrated.model_bucket_type = {migrated_type}
+         AND migrated.model = {migrated_model}
+         AND migrated.api_key_id = h.api_key_id
+         AND migrated.api_key_name = h.api_key_name
+         AND migrated.credential_id = h.credential_id
+         AND migrated.credential_label = h.credential_label
+         AND migrated.outcome = h.outcome
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE usage_latency_histogram_v4 (
+            hourly_id INTEGER NOT NULL,
+            metric TEXT NOT NULL CHECK (metric IN ('total', 'first_output')),
+            bucket_index INTEGER NOT NULL,
+            sample_count INTEGER NOT NULL,
+            PRIMARY KEY (hourly_id, metric, bucket_index),
+            FOREIGN KEY (hourly_id) REFERENCES usage_hourly_v4(id) ON DELETE CASCADE
+        ) WITHOUT ROWID
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO usage_latency_histogram_v4(
+            hourly_id, metric, bucket_index, sample_count
+        )
+        SELECT mapping.new_id, histogram.metric, histogram.bucket_index,
+               SUM(histogram.sample_count)
+        FROM usage_latency_histogram histogram
+        JOIN usage_hourly_v4_mapping mapping
+          ON mapping.old_id = histogram.hourly_id
+        GROUP BY mapping.new_id, histogram.metric, histogram.bucket_index
+        """
+    )
+    connection.execute("DROP TABLE usage_latency_histogram")
+    connection.execute("DROP TABLE usage_hourly")
+    connection.execute("ALTER TABLE usage_hourly_v4 RENAME TO usage_hourly")
+    connection.execute(
+        "ALTER TABLE usage_latency_histogram_v4 RENAME TO usage_latency_histogram"
+    )
+    connection.execute(
+        "CREATE INDEX idx_usage_hourly_user_hour ON usage_hourly(username, hour)"
+    )
+    connection.execute("DROP TABLE temp.usage_hourly_v4_mapping")
+
 
 def resolve_database_path(data_dir: Union[str, Path], cwd: Union[str, Path, None] = None) -> Path:
     """基于数据目录解析统一 SQLite 数据库路径。"""
@@ -195,7 +419,7 @@ class SQLiteDatabase:
     def _initialize_schema(self, connection: sqlite3.Connection) -> None:
         with _SCHEMA_LOCK:
             version = connection.execute("PRAGMA user_version").fetchone()[0]
-            if version not in (0, 1, 2, SCHEMA_VERSION):
+            if version not in (0, 1, 2, 3, SCHEMA_VERSION):
                 raise RuntimeError(
                     f"Unsupported SQLite schema version {version}; expected {SCHEMA_VERSION}"
                 )
@@ -209,13 +433,16 @@ class SQLiteDatabase:
             if version < SCHEMA_VERSION:
                 try:
                     connection.execute("BEGIN IMMEDIATE")
-                    statements = _SCHEMA_V3_STATEMENTS
+                    statements = _SCHEMA_V4_STATEMENTS
+                    if version < 3:
+                        statements = _SCHEMA_V3_STATEMENTS + statements
                     if version < 2:
                         statements = _SCHEMA_V2_STATEMENTS + statements
                     if version < 1:
                         statements = _SCHEMA_V1_STATEMENTS + statements
                     for statement in statements:
                         connection.execute(statement)
+                    _migrate_usage_model_buckets(connection)
                     connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                     connection.commit()
                 except Exception:
