@@ -14,8 +14,8 @@ cd frontend && pnpm run dev
 # 安装后端开发依赖
 venv/bin/python3 -m pip install -r requirements-dev.txt
 
-# 后端验证（unittest，行/分支覆盖率门槛 100%）
-venv/bin/python3 -m coverage run -m unittest discover -s tests
+# 后端验证（unittest，行/分支覆盖率门槛 100%；使用环境变量阻止大量日志污染输出）
+CODEBUDDY_LOG_LEVEL=CRITICAL venv/bin/python3 -m coverage run -m unittest discover -s tests
 venv/bin/python3 -m coverage report
 
 # 前端完整验证
