@@ -13,6 +13,23 @@ function cssRuleBody(selector: string): string {
   return match[1];
 }
 
+describe('页面滚动条样式', () => {
+  it('根视口始终为传统滚动条预留单侧空间', () => {
+    const htmlRule = cssRuleBody('html');
+    const bodyRule = cssRuleBody('body');
+
+    expect(htmlRule).toContain('scrollbar-gutter: stable');
+    expect(htmlRule).not.toContain('both-edges');
+    expect(bodyRule).toContain('overflow-y: scroll');
+  });
+
+  it('滚动锁释放传统滚动条时同步补偿固定定位的全局提示', () => {
+    expect(cssRuleBody('.toast-host')).toContain(
+      'margin-right: var(--page-scrollbar-compensation, 0px)',
+    );
+  });
+});
+
 describe('页面切换样式', () => {
   it('页面离场态不拉伸页面根节点高度', () => {
     const pageLeaveActiveRule = cssRuleBody('.page-leave-active');

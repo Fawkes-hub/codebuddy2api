@@ -16,8 +16,10 @@ interface ElementState {
 
 const entries: OverlayEntry[] = [];
 const isolatedElements = new Map<HTMLElement, ElementState>();
+const pageScrollbarCompensationProperty = '--page-scrollbar-compensation';
 let originalBodyOverflow: string | null = null;
 let originalBodyPaddingRight = '';
+let originalPageScrollbarCompensation = '';
 
 const focusableSelector = [
   'a[href]',
@@ -51,24 +53,44 @@ function syncPageState(): void {
     if (originalBodyOverflow !== null) {
       document.body.style.overflow = originalBodyOverflow;
       document.body.style.paddingRight = originalBodyPaddingRight;
+      document.documentElement.style.setProperty(
+        pageScrollbarCompensationProperty,
+        originalPageScrollbarCompensation,
+      );
       originalBodyOverflow = null;
       originalBodyPaddingRight = '';
+      originalPageScrollbarCompensation = '';
     }
     return;
   }
 
-  if (originalBodyOverflow === null) {
+  const startsScrollLock = originalBodyOverflow === null;
+  let clientWidthBeforeLock: number | null = null;
+  if (startsScrollLock) {
     originalBodyOverflow = document.body.style.overflow;
     originalBodyPaddingRight = document.body.style.paddingRight;
-    const scrollbarWidth = window.innerWidth - document.documentElement.clientWidth;
-    if (scrollbarWidth > 0) {
+    originalPageScrollbarCompensation = document.documentElement.style.getPropertyValue(
+      pageScrollbarCompensationProperty,
+    );
+    clientWidthBeforeLock = document.documentElement.clientWidth;
+  }
+  document.body.style.overflow = 'hidden';
+  if (clientWidthBeforeLock !== null) {
+    const releasedScrollbarWidth = Math.max(
+      0,
+      document.documentElement.clientWidth - clientWidthBeforeLock,
+    );
+    document.documentElement.style.setProperty(
+      pageScrollbarCompensationProperty,
+      `${releasedScrollbarWidth}px`,
+    );
+    if (releasedScrollbarWidth > 0) {
       const currentPaddingRight = Number.parseFloat(
         window.getComputedStyle(document.body).paddingRight,
       );
-      document.body.style.paddingRight = `${(currentPaddingRight || 0) + scrollbarWidth}px`;
+      document.body.style.paddingRight = `${(currentPaddingRight || 0) + releasedScrollbarWidth}px`;
     }
   }
-  document.body.style.overflow = 'hidden';
   const allowedElements = entries.slice(modalIndex).flatMap((entry) => entry.elements);
   Array.from(document.body.children).forEach((child) => {
     if (!(child instanceof HTMLElement)) return;

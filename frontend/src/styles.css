@@ -342,11 +342,13 @@
 }
 
 html {
+  scrollbar-gutter: stable;
   -webkit-text-size-adjust: 100%;
 }
 
 body {
   margin: 0;
+  overflow-y: scroll;
   background: var(--bg);
   color: var(--text);
   font-family: var(--font-sans);
@@ -381,6 +383,10 @@ button:not(:disabled) {
 
 button:disabled {
   cursor: not-allowed;
+}
+
+.toast-host {
+  margin-right: var(--page-scrollbar-compensation, 0px);
 }
 
 .toast-item {

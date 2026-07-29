@@ -113,6 +113,7 @@ docker run --rm -it -v "$PWD/secrets:/app/secrets" ghcr.io/iceean/codebuddy2api:
 - 可编辑文本控件使用 Enter 提交、确认或选择时，必须在非自动重复的 `keydown` 阶段锁存 `KeyboardEvent.isComposing` 判定，并在该按键可能触发的 `input` 更新完成后再执行（通常在对应 `keyup`）；不得直接用可能已重置的 `keyup.isComposing` 判定，也不得在 `keydown` 同步读取尚未更新的模型。共享组件与直接消费键盘事件的页面处理器都应覆盖这些约束。
 - 可聚焦元素不要使用 Tailwind `transition-colors`；它会一并过渡 `outline-color`，使暗色模式的键盘焦点轮廓从浏览器默认浅色短暂闪烁。应使用 `transition-[color]` 或 `transition-[color,background-color]` 等明确的过渡属性。
 - 主题动画只在根节点维护一个数值进度，所有动画语义色由该进度派生。不要为后代递归添加颜色 transition，也不要用 `dark:` 在两个动画语义变量间切换。需单调变化的颜色使用等效不透明端点，避免透明色插值泛白；连续主题切换必须从当前进度反向，路由切换期间禁止启动主题切换。
+- 根视口防滚动条抖动不能只依赖 `scrollbar-gutter: stable`，Chromium 在当前 body overflow 传播结构下仍可能等到内容溢出才占用宽度；桌面传统滚动条由 `body { overflow-y: scroll; }` 固定槽位。Modal/Drawer 锁滚动时只能补偿隐藏滚动条前后 `clientWidth` 的实际增量，不能再按 `innerWidth - clientWidth` 无条件补偿，否则支持稳定 gutter 的浏览器会产生双重留白；overlay 滚动条环境不应额外补偿。补偿不能只加在普通流的 `body` 上，可在锁定期间持续显示的固定定位全局宿主也必须消费同一实际增量。
 - 内容哈希的静态资源长期 `immutable`，入口 HTML 为 `no-store`，未哈希资源必须重新验证。缺少 `frontend/dist/index.html` 时快速失败，不提供单文件回退。
 - 前端开发/构建要求 Node.js 24.11+。Vite 8/Rolldown 手动分包使用 `rollupOptions.output.codeSplitting.groups`，不要恢复对象形式 `manualChunks`；TypeScript 配置保留 `vite/client` 类型。
 
