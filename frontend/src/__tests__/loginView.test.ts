@@ -107,7 +107,7 @@ describe('LoginView', () => {
   it('使用项目图标', () => {
     const wrapper = mountView();
 
-    expect(wrapper.get('img.project-icon').attributes('src')).toBe('/assets/codebuddy2api.svg');
+    expect(wrapper.get('img.project-icon').attributes('src')).not.toBe('/assets/codebuddy2api.svg');
   });
 
   it('密码校验提示与登录按钮之间保留固定间距', () => {

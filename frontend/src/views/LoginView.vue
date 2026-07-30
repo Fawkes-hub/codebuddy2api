@@ -6,13 +6,13 @@ import CFormItem from '../components/ui/CFormItem.vue';
 import CInput from '../components/ui/CInput.vue';
 import CButton from '../components/ui/CButton.vue';
 import { useToast } from '../composables/useToast';
+import { PROJECT_ICON_URL } from '../projectAssets';
 import { useSessionStore } from '../stores/session';
 import { createLoginSubmitter } from '../utils/loginSubmit';
 
 const session = useSessionStore();
 const toast = useToast();
 const formRef = ref<InstanceType<typeof CForm> | null>(null);
-const PROJECT_ICON_URL = '/assets/codebuddy2api.svg';
 const model = reactive({
   username: '',
   password: '',

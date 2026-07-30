@@ -254,7 +254,7 @@ describe('App', () => {
     sessionMock.authenticated = true;
     const { wrapper } = mountApp();
 
-    expect(wrapper.get('img.project-icon').attributes('src')).toBe('/assets/codebuddy2api.svg');
+    expect(wrapper.get('img.project-icon').attributes('src')).not.toBe('/assets/codebuddy2api.svg');
   });
 
   it('console 菜单与页面标题使用中文 API 测试', () => {

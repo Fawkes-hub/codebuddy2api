@@ -20,6 +20,7 @@ import CButton from './components/ui/CButton.vue';
 import CSpin from './components/ui/CSpin.vue';
 import CDrawer from './components/ui/CDrawer.vue';
 import CToastHost from './components/CToastHost.vue';
+import { PROJECT_ICON_URL } from './projectAssets';
 import { useSessionStore } from './stores/session';
 import { THEME_ICON_SWAP_DELAY_MS, useThemeStore } from './stores/theme';
 import type { ThemeMode } from './stores/theme';
@@ -29,7 +30,6 @@ const theme = useThemeStore();
 const route = useRoute();
 const router = useRouter();
 const queryClient = useQueryClient();
-const PROJECT_ICON_URL = '/assets/codebuddy2api.svg';
 
 const navItems = [
   { routeName: 'dashboard', label: '总览', icon: Activity },

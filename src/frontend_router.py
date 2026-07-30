@@ -1,9 +1,13 @@
 """管理页前端静态资源路由。"""
+import asyncio
 import re
+from datetime import timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
-from fastapi import APIRouter, HTTPException
-from fastapi.responses import FileResponse
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import FileResponse, Response
+from starlette.datastructures import Headers
 
 router = APIRouter()
 
@@ -24,7 +28,16 @@ REVALIDATE_ASSET_HEADERS = {
     "Cache-Control": "public, max-age=0, must-revalidate",
 }
 _HASHED_VITE_ASSET = re.compile(
-    r"^assets/.+-[A-Za-z0-9_-]{8,}\.(?:css|js|mjs|woff|woff2|ttf|otf)$"
+    r"^assets/.+-(?:[A-Za-z0-9_-]{8}|[a-f0-9]{12})\."
+    r"(?:css|js|mjs|svg|woff|woff2|ttf|otf)$"
+)
+_ASCTIME_DATE = re.compile(
+    r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) "
+    r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) "
+    r"(?:[0-9]{2}| [0-9]) [0-9]{2}:[0-9]{2}:[0-9]{2} [0-9]{4}"
+)
+_NOT_MODIFIED_HEADERS = frozenset(
+    {"cache-control", "content-location", "date", "etag", "expires", "last-modified", "vary"}
 )
 
 
@@ -54,7 +67,47 @@ async def get_frontend_index_response() -> FileResponse:
         headers=NO_CACHE_HEADERS,
     )
 
-async def get_frontend_static_response(asset_path: str) -> FileResponse:
+def _is_not_modified(response_headers: Headers, request_headers: Headers) -> bool:
+    if_none_match = request_headers.get("if-none-match")
+    if if_none_match is not None:
+        etag = response_headers["etag"]
+        return any(
+            candidate == "*" or candidate.removeprefix("W/") == etag
+            for candidate in (value.strip() for value in if_none_match.split(","))
+        )
+
+    if_modified_since = request_headers.get("if-modified-since")
+    if if_modified_since is None:
+        return False
+    try:
+        modified_since = parsedate_to_datetime(if_modified_since)
+        if modified_since.tzinfo is None:
+            if _ASCTIME_DATE.fullmatch(if_modified_since) is None:
+                return False
+            modified_since = modified_since.replace(tzinfo=timezone.utc)
+        else:
+            modified_since = modified_since.astimezone(timezone.utc)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    last_modified = parsedate_to_datetime(response_headers["last-modified"]).astimezone(
+        timezone.utc
+    )
+    return modified_since >= last_modified
+
+
+def _not_modified_response(headers: Headers) -> Response:
+    return Response(
+        status_code=304,
+        headers={
+            name: value for name, value in headers.items() if name in _NOT_MODIFIED_HEADERS
+        },
+    )
+
+
+async def get_frontend_static_response(
+    asset_path: str,
+    request_headers: Headers | None = None,
+) -> Response:
     """优先返回 Vite 构建产物，未构建时回退到公共静态资源。"""
     file_path = _safe_static_file(asset_path)
     try:
@@ -67,7 +120,11 @@ async def get_frontend_static_response(asset_path: str) -> FileResponse:
             if _HASHED_VITE_ASSET.fullmatch(asset_path)
             else REVALIDATE_ASSET_HEADERS
         )
-    return FileResponse(file_path, headers=headers)
+    stat_result = await asyncio.to_thread(file_path.stat)
+    response = FileResponse(file_path, headers=headers, stat_result=stat_result)
+    if request_headers is not None and _is_not_modified(response.headers, request_headers):
+        return _not_modified_response(response.headers)
+    return response
 
 
 @router.get("/", response_class=FileResponse, include_in_schema=False)
@@ -81,5 +138,5 @@ async def serve_admin():
 
 
 @router.get("/assets/{asset_path:path}", response_class=FileResponse, include_in_schema=False)
-async def serve_frontend_asset(asset_path: str):
-    return await get_frontend_static_response(f"assets/{asset_path}")
+async def serve_frontend_asset(asset_path: str, request: Request):
+    return await get_frontend_static_response(f"assets/{asset_path}", request.headers)
