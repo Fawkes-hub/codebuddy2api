@@ -1,12 +1,13 @@
 import { createRouter, createWebHashHistory } from 'vue-router';
-import DashboardView from './views/DashboardView.vue';
-import StatsView from './views/StatsView.vue';
-import CredentialsView from './views/CredentialsView.vue';
-import ApiKeysView from './views/ApiKeysView.vue';
-import ApiConsoleView from './views/ApiConsoleView.vue';
-import ApiDocsView from './views/ApiDocsView.vue';
-import SettingsView from './views/SettingsView.vue';
-import NotFoundView from './views/NotFoundView.vue';
+
+const DashboardView = () => import('./views/DashboardView.vue');
+const StatsView = () => import('./views/StatsView.vue');
+const CredentialsView = () => import('./views/CredentialsView.vue');
+const ApiKeysView = () => import('./views/ApiKeysView.vue');
+const ApiConsoleView = () => import('./views/ApiConsoleView.vue');
+const ApiDocsView = () => import('./views/ApiDocsView.vue');
+const SettingsView = () => import('./views/SettingsView.vue');
+const NotFoundView = () => import('./views/NotFoundView.vue');
 
 const router = createRouter({
   history: createWebHashHistory(),
