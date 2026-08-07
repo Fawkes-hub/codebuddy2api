@@ -7,6 +7,7 @@ import App from './App.vue';
 import router from './router';
 import { isUnauthorizedError } from './api/client';
 import { useToast } from './composables/useToast';
+import { chunkLoadRecovery } from './utils/chunkLoadRecovery';
 import './styles.css';
 
 const app = createApp(App);
@@ -21,6 +22,14 @@ function getErrorMessage(err: unknown, fallback: string): string {
 }
 
 const toast = useToast();
+
+// 必须早于 app.use(router)，否则会错过初始异步路由的 Vite 事件。
+chunkLoadRecovery.install(router, {
+  onUnexpectedNavigationError(error) {
+    console.error(error);
+    toast.error('页面跳转失败，请重试');
+  },
+});
 
 const queryClient = new QueryClient({
   defaultOptions: {

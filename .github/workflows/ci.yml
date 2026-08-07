@@ -103,3 +103,9 @@ jobs:
 
       - name: Run frontend tests
         run: pnpm run test:coverage
+
+      - name: Install Chromium for Playwright
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Run frontend browser tests
+        run: pnpm run e2e

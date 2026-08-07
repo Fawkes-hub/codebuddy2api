@@ -1,14 +1,17 @@
-import { mount } from '@vue/test-utils';
+import { enableAutoUnmount, mount } from '@vue/test-utils';
 import { defineComponent, h } from 'vue';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+enableAutoUnmount(afterEach);
 
 const {
   sessionMock,
   routeMock,
-  routerMock,
   queryClientMock,
   setUnauthorizedHandlerMock,
   themeMock,
+  chunkLoadRecoveryMock,
+  releaseChunkReloadMock,
 } = vi.hoisted(() => ({
   sessionMock: {
     ready: false,
@@ -21,11 +24,13 @@ const {
     endLocalSession: vi.fn<() => void>(),
   },
   routeMock: { name: 'dashboard' as string | undefined },
-  routerMock: {
-    push: vi.fn<(to: string | Record<string, unknown>) => Promise<{ type: number } | undefined>>(),
-  },
   queryClientMock: { clear: vi.fn<() => void>() },
   setUnauthorizedHandlerMock: vi.fn<(handler: (() => void) | null) => void>(),
+  releaseChunkReloadMock: vi.fn<() => void>(),
+  chunkLoadRecoveryMock: {
+    push: vi.fn<(to: string | Record<string, unknown>) => Promise<{ type: number } | undefined>>(),
+    deferReload: vi.fn<() => () => void>(),
+  },
   themeMock: {
     mode: 'light' as 'light' | 'dark',
     init: vi.fn<() => void>(),
@@ -51,7 +56,6 @@ vi.mock('vue-router', () => ({
     'type' in failure &&
     (type === undefined || (failure as { type: number }).type === type),
   useRoute: () => routeMock,
-  useRouter: () => routerMock,
   RouterView: { template: '<div class="router-view" />' },
 }));
 
@@ -63,7 +67,12 @@ vi.mock('../api/client', () => ({
   setUnauthorizedHandler: setUnauthorizedHandlerMock,
 }));
 
+vi.mock('../utils/chunkLoadRecovery', () => ({
+  chunkLoadRecovery: chunkLoadRecoveryMock,
+}));
+
 import App from '../App.vue';
+
 const CButtonStub = defineComponent({
   name: 'CButton',
   inheritAttrs: false,
@@ -131,6 +140,7 @@ function mountApp(matches = true) {
   const wrapper = mount(App, {
     global: {
       stubs: {
+        ChunkLoadRecoveryDialog: true,
         CButton: CButtonStub,
         CSpin: CSpinStub,
         CDrawer: CDrawerStub,
@@ -168,10 +178,13 @@ describe('App', () => {
     sessionMock.logout.mockResolvedValue(undefined);
     sessionMock.endLocalSession.mockReset();
     routeMock.name = 'dashboard';
-    routerMock.push.mockReset();
-    routerMock.push.mockResolvedValue(undefined);
+    chunkLoadRecoveryMock.push.mockReset();
+    chunkLoadRecoveryMock.push.mockResolvedValue(undefined);
     queryClientMock.clear.mockReset();
     setUnauthorizedHandlerMock.mockReset();
+    chunkLoadRecoveryMock.deferReload.mockReset();
+    chunkLoadRecoveryMock.deferReload.mockReturnValue(releaseChunkReloadMock);
+    releaseChunkReloadMock.mockReset();
     themeMock.mode = 'light';
     themeMock.init.mockReset();
     themeMock.toggle.mockReset();
@@ -424,7 +437,7 @@ describe('App', () => {
     await credentialButton?.trigger('click');
 
     expect(state.mobileNavOpen).toBe(false);
-    expect(routerMock.push).toHaveBeenCalledWith({ name: 'credentials' });
+    expect(chunkLoadRecoveryMock.push).toHaveBeenCalledWith({ name: 'credentials' });
   });
 
   it('移动抽屉打开时切换到桌面断点会自动关闭', async () => {
@@ -462,7 +475,7 @@ describe('App', () => {
       .findAll('button')
       .find((button) => button.text().includes('凭证'));
     await credentialButton?.trigger('click');
-    expect(routerMock.push).toHaveBeenCalledWith({ name: 'credentials' });
+    expect(chunkLoadRecoveryMock.push).toHaveBeenCalledWith({ name: 'credentials' });
   });
 
   it('缺少路由名时使用 dashboard 作为活动路由', () => {
@@ -637,22 +650,23 @@ describe('App', () => {
     await state.logout();
     expect(sessionMock.logout).toHaveBeenCalledOnce();
     expect(queryClientMock.clear).toHaveBeenCalledTimes(2);
-    expect(routerMock.push).toHaveBeenCalledWith('/');
-    expect(routerMock.push.mock.invocationCallOrder[0]).toBeLessThan(
+    expect(chunkLoadRecoveryMock.push).toHaveBeenCalledWith('/');
+    expect(chunkLoadRecoveryMock.push.mock.invocationCallOrder[0]).toBeLessThan(
       sessionMock.logout.mock.invocationCallOrder[0],
     );
+    expect(releaseChunkReloadMock).toHaveBeenCalledOnce();
   });
 
   it('受保护路由拒绝离开时保留会话与查询缓存', async () => {
     sessionMock.ready = true;
     sessionMock.authenticated = true;
-    routerMock.push.mockResolvedValue({ type: 4 });
+    chunkLoadRecoveryMock.push.mockResolvedValue({ type: 4 });
     const { wrapper } = mountApp();
     const state = (wrapper.vm.$ as any).setupState;
 
     await state.logout();
 
-    expect(routerMock.push).toHaveBeenCalledWith('/');
+    expect(chunkLoadRecoveryMock.push).toHaveBeenCalledWith('/');
     expect(sessionMock.logout).not.toHaveBeenCalled();
     expect(queryClientMock.clear).not.toHaveBeenCalled();
   });
@@ -660,7 +674,7 @@ describe('App', () => {
   it('根路径重复导航不会阻止退出', async () => {
     sessionMock.ready = true;
     sessionMock.authenticated = true;
-    routerMock.push.mockResolvedValue({ type: 16 });
+    chunkLoadRecoveryMock.push.mockResolvedValue({ type: 16 });
     const { wrapper } = mountApp();
     const state = (wrapper.vm.$ as any).setupState;
 
@@ -668,6 +682,20 @@ describe('App', () => {
 
     expect(sessionMock.logout).toHaveBeenCalledOnce();
     expect(queryClientMock.clear).toHaveBeenCalledTimes(2);
+  });
+
+  it('退出导航发生非 chunk 异常时快速失败且不结束会话', async () => {
+    sessionMock.ready = true;
+    sessionMock.authenticated = true;
+    chunkLoadRecoveryMock.push.mockRejectedValue(new Error('guard bug'));
+    const { wrapper } = mountApp();
+    const state = (wrapper.vm.$ as any).setupState;
+
+    await expect(state.logout()).rejects.toThrow('guard bug');
+
+    expect(sessionMock.logout).not.toHaveBeenCalled();
+    expect(queryClientMock.clear).not.toHaveBeenCalled();
+    expect(releaseChunkReloadMock).toHaveBeenCalledOnce();
   });
 
   it('主动退出请求失败时仍再次清缓存并返回登录页', async () => {
@@ -680,7 +708,7 @@ describe('App', () => {
     await expect(state.logout()).rejects.toThrow('network');
 
     expect(queryClientMock.clear).toHaveBeenCalledTimes(2);
-    expect(routerMock.push).toHaveBeenCalledWith('/');
+    expect(chunkLoadRecoveryMock.push).toHaveBeenCalledWith('/');
   });
 
   it('卸载时移除媒体监听并清除未授权 handler', () => {

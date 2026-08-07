@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, reactive, ref, watch } from 'vue';
-import { isNavigationFailure, NavigationFailureType, useRoute, useRouter } from 'vue-router';
+import { isNavigationFailure, NavigationFailureType, useRoute } from 'vue-router';
 import { useQueryClient } from '@tanstack/vue-query';
 import {
   Activity,
@@ -19,16 +19,18 @@ import LoginView from './views/LoginView.vue';
 import CButton from './components/ui/CButton.vue';
 import CSpin from './components/ui/CSpin.vue';
 import CDrawer from './components/ui/CDrawer.vue';
+import ChunkLoadRecoveryDialog from './components/ChunkLoadRecoveryDialog.vue';
 import CToastHost from './components/CToastHost.vue';
 import { PROJECT_ICON_URL } from './projectAssets';
 import { useSessionStore } from './stores/session';
 import { THEME_ICON_SWAP_DELAY_MS, useThemeStore } from './stores/theme';
 import type { ThemeMode } from './stores/theme';
 import { setUnauthorizedHandler } from './api/client';
+import { chunkLoadRecovery } from './utils/chunkLoadRecovery';
+
 const session = useSessionStore();
 const theme = useThemeStore();
 const route = useRoute();
-const router = useRouter();
 const queryClient = useQueryClient();
 
 const navItems = [
@@ -106,9 +108,13 @@ function updateMobile(event: MediaQueryListEvent | MediaQueryList): void {
   if (event.matches) mobileNavOpen.value = false;
 }
 
-function navigateMobile(routeName: string): void {
+function navigateMobile(routeName: string) {
   mobileNavOpen.value = false;
-  router.push({ name: routeName });
+  return chunkLoadRecovery.push({ name: routeName });
+}
+
+function navigateDesktop(routeName: string) {
+  return chunkLoadRecovery.push({ name: routeName });
 }
 
 function startPageTransition(): void {
@@ -143,19 +149,24 @@ onUnmounted(() => {
 });
 
 async function logout() {
-  const navigationFailure = await router.push('/');
-  if (
-    navigationFailure &&
-    !isNavigationFailure(navigationFailure, NavigationFailureType.duplicated)
-  ) {
-    return;
-  }
-
-  queryClient.clear();
+  const releaseChunkReload = chunkLoadRecovery.deferReload();
   try {
-    await session.logout();
-  } finally {
+    const navigationFailure = await chunkLoadRecovery.push('/');
+    if (
+      navigationFailure &&
+      !isNavigationFailure(navigationFailure, NavigationFailureType.duplicated)
+    ) {
+      return;
+    }
+
     queryClient.clear();
+    try {
+      await session.logout();
+    } finally {
+      queryClient.clear();
+    }
+  } finally {
+    releaseChunkReload();
   }
 }
 
@@ -177,6 +188,8 @@ function retrySessionRestore(): void {
 </script>
 
 <template>
+  <ChunkLoadRecoveryDialog />
+
   <div v-if="!session.ready" class="boot-screen grid min-h-screen place-items-center bg-bg">
     <CSpin size="lg" />
   </div>
@@ -238,7 +251,7 @@ function retrySessionRestore(): void {
             ]"
             :aria-current="activeRoute === item.routeName ? 'page' : undefined"
             type="button"
-            @click="router.push({ name: item.routeName })"
+            @click="navigateDesktop(item.routeName)"
           >
             <component :is="item.icon" :size="18" />
             <span>{{ item.label }}</span>

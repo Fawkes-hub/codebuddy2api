@@ -1,0 +1,35 @@
+:root {
+  color: #172033;
+  font-family: sans-serif;
+}
+
+body {
+  margin: 0;
+}
+
+main,
+.chunk-load-error-screen {
+  box-sizing: border-box;
+  min-height: 100vh;
+  padding: 2rem;
+}
+
+section {
+  display: grid;
+  max-width: 32rem;
+  gap: 1rem;
+}
+
+button,
+input {
+  padding: 0.5rem;
+}
+
+.chunk-load-error-screen {
+  position: fixed;
+  z-index: 10;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: white;
+}

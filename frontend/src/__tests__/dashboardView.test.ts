@@ -5,7 +5,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 const { copyMock, pushMock, statsOverviewMock, useQueryMock } = vi.hoisted(() => ({
   copyMock: vi.fn<(text: string, successMessage?: string) => Promise<boolean>>(),
-  pushMock: vi.fn<(location: unknown) => void>(),
+  pushMock: vi.fn<(location: unknown) => Promise<void>>(),
   statsOverviewMock: vi.fn<(query: unknown) => Promise<unknown>>(),
   useQueryMock: vi.fn<(options: unknown) => unknown>(),
 }));
@@ -24,8 +24,8 @@ vi.mock('@tanstack/vue-query', () => ({
   useQuery: useQueryMock,
 }));
 
-vi.mock('vue-router', () => ({
-  useRouter: () => ({ push: pushMock }),
+vi.mock('../utils/chunkLoadRecovery', () => ({
+  chunkLoadRecovery: { push: pushMock },
 }));
 
 vi.mock('../composables/useClipboard', () => ({
@@ -93,6 +93,7 @@ describe('DashboardView', () => {
     }
     copyMock.mockReset();
     pushMock.mockReset();
+    pushMock.mockResolvedValue(undefined);
     statsOverviewMock.mockReset();
     statsOverviewMock.mockResolvedValue({});
   });

@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { computed, onUnmounted, ref, watch } from 'vue';
 import { useQuery } from '@tanstack/vue-query';
-import { useRouter } from 'vue-router';
 import { Activity, CheckCircle2, CircleSlash, Clock3, KeyRound, Link } from '@lucide/vue';
 import StatTile from '../components/StatTile.vue';
 import RefreshButton from '../components/RefreshButton.vue';
@@ -27,9 +26,9 @@ import {
 } from '../utils/dashboardStatus';
 import { useSessionStore } from '../stores/session';
 import { adminQueryKeys } from '../utils/adminQueryKeys';
+import { chunkLoadRecovery } from '../utils/chunkLoadRecovery';
 
 const { copy } = useClipboard();
-const router = useRouter();
 const session = useSessionStore();
 const queryKeys = adminQueryKeys(session.username);
 const STATUS_REFETCH_INTERVAL_MS = 600_000;
@@ -220,8 +219,8 @@ function copyApiBaseUrl() {
   copy(value, '客户端入口地址已复制');
 }
 
-function openStats(): void {
-  void router.push({ name: 'stats' });
+function openStats() {
+  return chunkLoadRecovery.push({ name: 'stats' });
 }
 </script>
 

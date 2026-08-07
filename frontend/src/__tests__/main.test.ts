@@ -7,6 +7,7 @@ const {
   queryCacheOptions,
   mutationCacheOptions,
   unauthorizedErrorMock,
+  chunkLoadRecoveryMock,
 } = vi.hoisted(() => ({
   appMock: {
     component: vi.fn<(name: string, component?: unknown) => unknown>(),
@@ -18,6 +19,15 @@ const {
   queryCacheOptions: [] as Array<{ onError: (error: unknown) => void }>,
   mutationCacheOptions: [] as Array<{ onError: (error: unknown) => void }>,
   unauthorizedErrorMock: vi.fn<(error: unknown) => boolean>(),
+  chunkLoadRecoveryMock: {
+    install:
+      vi.fn<
+        (
+          router: unknown,
+          options: { onUnexpectedNavigationError: (error: unknown) => void },
+        ) => () => void
+      >(),
+  },
 }));
 
 vi.mock('vue', async (importOriginal) => {
@@ -58,6 +68,10 @@ vi.mock('../api/client', () => ({
   isUnauthorizedError: unauthorizedErrorMock,
 }));
 
+vi.mock('../utils/chunkLoadRecovery', () => ({
+  chunkLoadRecovery: chunkLoadRecoveryMock,
+}));
+
 describe('main', () => {
   beforeEach(async () => {
     vi.resetModules();
@@ -71,6 +85,8 @@ describe('main', () => {
     queryCacheOptions.length = 0;
     mutationCacheOptions.length = 0;
     unauthorizedErrorMock.mockReset();
+    chunkLoadRecoveryMock.install.mockReset();
+    chunkLoadRecoveryMock.install.mockReturnValue(vi.fn());
 
     await import('../main');
   });
@@ -82,6 +98,15 @@ describe('main', () => {
       ['vue-query-plugin', { queryClient: expect.any(Object) }],
     ]);
     expect(appMock.mount).toHaveBeenCalledWith('#app');
+    expect(chunkLoadRecoveryMock.install).toHaveBeenCalledWith('router-plugin', {
+      onUnexpectedNavigationError: expect.any(Function),
+    });
+    expect(appMock.use.mock.invocationCallOrder[0]).toBeLessThan(
+      chunkLoadRecoveryMock.install.mock.invocationCallOrder[0],
+    );
+    expect(chunkLoadRecoveryMock.install.mock.invocationCallOrder[0]).toBeLessThan(
+      appMock.use.mock.invocationCallOrder[1],
+    );
     expect(queryClientOptions).toHaveLength(1);
     expect(queryClientOptions[0]).toEqual(
       expect.objectContaining({
@@ -94,6 +119,18 @@ describe('main', () => {
         },
       }),
     );
+  });
+
+  it('非 chunk 路由错误保留控制台错误并显示通用提示', () => {
+    const error = new Error('路由守卫异常');
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const options = chunkLoadRecoveryMock.install.mock.calls[0][1];
+
+    options.onUnexpectedNavigationError(error);
+
+    expect(consoleError).toHaveBeenCalledWith(error);
+    expect(toastMock.error).toHaveBeenCalledWith('页面跳转失败，请重试');
+    consoleError.mockRestore();
   });
 
   it('查询缓存按错误类型提示', () => {
