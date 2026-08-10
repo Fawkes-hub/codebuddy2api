@@ -43,6 +43,7 @@ if (targetChunkB === undefined) throw new Error('未找到 B 版本目标页 chu
 
 let phase = 'a';
 let targetMissing = false;
+let documentDelayMs = 0;
 let documentRequests = 0;
 
 function sendJson(response, status, value) {
@@ -67,19 +68,26 @@ const server = createServer(async (request, response) => {
   try {
     const url = new URL(request.url ?? '/', `http://127.0.0.1:${port}`);
     if (url.pathname === '/__control/state') {
-      sendJson(response, 200, { phase, targetMissing, documentRequests });
+      sendJson(response, 200, { phase, targetMissing, documentDelayMs, documentRequests });
       return;
     }
     if (request.method === 'POST' && url.pathname === '/__control/reset') {
       phase = 'a';
       targetMissing = false;
+      documentDelayMs = 0;
       documentRequests = 0;
       sendJson(response, 200, { ok: true });
       return;
     }
     if (request.method === 'POST' && url.pathname === '/__control/switch') {
+      const requestedDelay = Number(url.searchParams.get('document-delay-ms') ?? '0');
+      if (!Number.isSafeInteger(requestedDelay) || requestedDelay < 0) {
+        sendJson(response, 400, { error: 'document-delay-ms 必须是非负安全整数' });
+        return;
+      }
       phase = 'b';
       targetMissing = url.searchParams.get('missing') === '1';
+      documentDelayMs = requestedDelay;
       sendJson(response, 200, { ok: true });
       return;
     }
@@ -89,6 +97,9 @@ const server = createServer(async (request, response) => {
     if (pathname === '/' || pathname === '/index.html') {
       pathname = '/index.html';
       documentRequests += 1;
+      if (documentDelayMs > 0) {
+        await new Promise((resolvePromise) => setTimeout(resolvePromise, documentDelayMs));
+      }
     }
     if (targetMissing && pathname === `/assets/${targetChunkB}`) {
       response.writeHead(404).end();

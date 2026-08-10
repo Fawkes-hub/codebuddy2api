@@ -118,8 +118,8 @@ docker run --rm -it -v "$PWD/secrets:/app/secrets" ghcr.io/iceean/codebuddy2api:
 - 主题动画只在根节点维护一个数值进度，所有动画语义色由该进度派生。不要为后代递归添加颜色 transition，也不要用 `dark:` 在两个动画语义变量间切换。需单调变化的颜色使用等效不透明端点，避免透明色插值泛白；连续主题切换必须从当前进度反向，路由切换期间禁止启动主题切换。
 - 根视口防滚动条抖动不能只依赖 `scrollbar-gutter: stable`，Chromium 在当前 body overflow 传播结构下仍可能等到内容溢出才占用宽度；桌面传统滚动条由 `body { overflow-y: scroll; }` 固定槽位。Modal/Drawer 锁滚动时只能补偿隐藏滚动条前后 `clientWidth` 的实际增量，不能再按 `innerWidth - clientWidth` 无条件补偿，否则支持稳定 gutter 的浏览器会产生双重留白；overlay 滚动条环境不应额外补偿。补偿不能只加在普通流的 `body` 上，可在锁定期间持续显示的固定定位全局宿主也必须消费同一实际增量。
 - 内容哈希的静态资源长期 `immutable`，入口 HTML 为 `no-store`，未哈希资源必须重新验证并实际处理 `If-None-Match`、`If-Modified-Since` 返回无响应体的 304；仅设置 `Cache-Control` 不足以让直接 `FileResponse` 完成条件请求。`frontend/src/theme-init.js` 必须继续在 `<head>` 中同步外链以避免主题闪烁，由 Vite 构建插件输出内容哈希文件；项目 SVG 应进入 Vite 资源图并以哈希 URL 引用。新增哈希资源扩展名时同步更新后端识别规则。缺少 `frontend/dist/index.html` 时快速失败，不提供单文件回退。
-- 路由页面的主动导航统一使用 `chunkLoadRecovery.push()` / `replace()`；恢复器必须在 `app.use(router)` 前安装。它只处理路由页面的 Vite preload 错误，其他路由错误必须保留原始 Promise 拒绝、写入控制台并显示通用提示。
-- chunk 首次失败最多自动刷新一次，并在新文档按原 push/replace 语义续接目标；成功、重定向、守卫中止或更新导航会消费记录。刷新取消或重复失败时允许留在当前页；用户选择留下后，本页后续失败只能手动刷新。退出等临界操作用 `deferReload()` 延迟刷新。
+- 路由页面的主动导航统一使用 `chunkLoadRecovery.push()` / `replace()`；恢复器必须在 `app.use(router)` 前安装。Vite 的 `vite:preloadError` 也会覆盖 chunk 下载成功后的模块求值异常，不能单凭该事件判断资源加载失败；恢复器只处理已确认的路由资源获取或预加载错误，其他路由错误必须保留原始 Promise 拒绝、写入控制台并显示通用提示。
+- chunk 首次失败最多自动刷新一次，并在新文档按原 push/replace 语义续接目标；刷新仍在进行时，后发 chunk 失败只更新为最新恢复目标，不得启动第二次刷新。成功、重定向、守卫中止或更新导航会消费记录。刷新取消或重复失败时允许留在当前页；用户选择留下后，本页后续失败只能手动刷新。退出等临界操作用 `deferReload()` 延迟刷新。
 - 修改 chunk 恢复流程后必须运行 `pnpm run e2e`，用 Chromium 验证跨版本资源失效、历史栈、`beforeunload` 取消和防循环行为。
 - 前端开发/构建要求 Node.js 24.11+。Vite 8/Rolldown 手动分包使用 `rollupOptions.output.codeSplitting.groups`，不要恢复对象形式 `manualChunks`；TypeScript 配置保留 `vite/client` 类型。
 

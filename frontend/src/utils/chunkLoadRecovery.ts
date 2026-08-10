@@ -1,14 +1,19 @@
 import { readonly, ref, type Ref } from 'vue';
-import type {
-  NavigationFailure,
-  RouteLocationNormalized,
-  RouteLocationRaw,
-  Router,
+import {
+  isNavigationFailure,
+  NavigationFailureType,
+  type NavigationFailure,
+  type RouteLocationNormalized,
+  type RouteLocationRaw,
+  type Router,
 } from 'vue-router';
 
 const RECOVERY_STORAGE_KEY = 'codebuddy2api:chunk-reload-attempted';
 const RECOVERY_RECORD_VERSION = 1;
-const RELOAD_UNLOAD_CHECK_DELAY_MS = 1_000;
+const FALLBACK_RELOAD_STATUS_DELAY_MS = 1_000;
+const DYNAMIC_IMPORT_FETCH_ERROR_PATTERN =
+  /^(?:Failed to fetch dynamically imported module(?::|$)|error loading dynamically imported module(?::|$)|Importing a module script failed\.?$)/i;
+const VITE_CSS_PRELOAD_ERROR_PREFIX = 'Unable to preload CSS for ';
 
 type NavigationMode = 'push' | 'replace';
 type NavigationPromise = Promise<NavigationFailure | void>;
@@ -22,6 +27,7 @@ interface RecoveryRecord {
 interface NavigationIntent {
   target: string;
   mode: NavigationMode;
+  order: number;
   resume: boolean;
   superseded: boolean;
   chunkFailed: boolean;
@@ -33,13 +39,26 @@ interface StartupRecovery {
   intent?: NavigationIntent;
 }
 
+interface HistoryNavigationAttempt {
+  type: 'history';
+  target: string;
+  order: number;
+  route: RouteLocationNormalized | null;
+}
+
+type LatestNavigationAttempt =
+  { type: 'intent'; intent: NavigationIntent } | HistoryNavigationAttempt;
+
 interface InstallContext {
   generation: number;
   router: Router;
   onUnexpectedNavigationError: (error: unknown) => void;
   preloadErrors: WeakSet<Error>;
   routeIntents: WeakMap<object, NavigationIntent>;
+  routeNavigationOrders: WeakMap<object, number>;
   intents: Set<NavigationIntent>;
+  latestNavigationOrder: number;
+  latestNavigationAttempt: LatestNavigationAttempt | null;
   startupRecovery: StartupRecovery | null;
   automaticReload: 'available' | 'recorded' | 'disabled';
   successfulRouteSettled: boolean;
@@ -48,12 +67,23 @@ interface InstallContext {
 type RecoveryPhase =
   | { type: 'idle' }
   | { type: 'waiting'; record: RecoveryRecord }
-  | { type: 'reloading'; record: RecoveryRecord }
-  | { type: 'failed'; record: RecoveryRecord };
+  | { type: 'reloading'; record: RecoveryRecord; fallbackReloadPending: boolean }
+  | { type: 'failed'; record: RecoveryRecord; fallbackReloadPending: boolean };
+
+interface PageNavigation {
+  readonly currentEntry: NavigationHistoryEntry | null;
+  reload(): NavigationResult;
+}
+
+interface ReloadAttempt {
+  record: RecoveryRecord;
+}
 
 interface ChunkLoadRecoveryOptions {
   getStorage?: () => Storage;
+  getNavigation?: () => PageNavigation | undefined;
   reloadPage?: () => void;
+  stopPageLoading?: () => void;
 }
 
 interface ChunkLoadRecoveryInstallOptions {
@@ -97,6 +127,13 @@ function navigationModeForPush(to: RouteLocationRaw): NavigationMode {
   return typeof to === 'object' && to.replace === true ? 'replace' : 'push';
 }
 
+function isResourcePreloadError(error: Error): boolean {
+  return (
+    (error instanceof TypeError && DYNAMIC_IMPORT_FETCH_ERROR_PATTERN.test(error.message)) ||
+    error.message.startsWith(VITE_CSS_PRELOAD_ERROR_PREFIX)
+  );
+}
+
 /**
  * 恢复 Vite 构建更新后失效的路由页面 chunk。
  *
@@ -105,15 +142,17 @@ function navigationModeForPush(to: RouteLocationRaw): NavigationMode {
  */
 export function createChunkLoadRecovery({
   getStorage = () => window.sessionStorage,
+  getNavigation = () => window.navigation as Navigation | undefined,
   reloadPage = window.location.reload.bind(window.location),
+  stopPageLoading = window.stop.bind(window),
 }: ChunkLoadRecoveryOptions = {}): ChunkLoadRecovery {
   const failureState = ref<ChunkLoadFailure | null>(null);
   let context: InstallContext | null = null;
   let generation = 0;
   let phase: RecoveryPhase = { type: 'idle' };
   let reloadDeferrals = 0;
-  let reloadUnloadCheckTimer: number | undefined;
-  let pageHideObserved = false;
+  let fallbackReloadStatusTimer: number | undefined;
+  let activeReloadAttempt: ReloadAttempt | null = null;
 
   function removeRecoveryRecord(): void {
     try {
@@ -158,34 +197,90 @@ export function createChunkLoadRecovery({
     return null;
   }
 
-  function cancelReloadUnloadCheck(): void {
-    if (reloadUnloadCheckTimer === undefined) return;
-    window.clearTimeout(reloadUnloadCheckTimer);
-    reloadUnloadCheckTimer = undefined;
+  function cancelReloadAttempt(): void {
+    activeReloadAttempt = null;
+    if (fallbackReloadStatusTimer === undefined) return;
+    window.clearTimeout(fallbackReloadStatusTimer);
+    fallbackReloadStatusTimer = undefined;
   }
 
-  function showFailure(activeContext: InstallContext, record: RecoveryRecord): void {
-    phase = { type: 'failed', record };
+  function clearPendingFallbackReload(): void {
+    if ((phase.type === 'reloading' || phase.type === 'failed') && phase.fallbackReloadPending) {
+      phase = { ...phase, fallbackReloadPending: false };
+    }
+  }
+
+  function stopPendingPageLoad(): void {
+    if (phase.type !== 'reloading' && phase.type !== 'failed') return;
+    const hasPendingFallbackReload = phase.fallbackReloadPending;
+    if (activeReloadAttempt === null && !hasPendingFallbackReload) return;
+    const pendingPhase = phase;
+    stopPageLoading();
+    if (phase === pendingPhase && hasPendingFallbackReload) {
+      phase = { ...pendingPhase, fallbackReloadPending: false };
+    }
+  }
+
+  function pausePendingReload(): void {
+    if (phase.type !== 'reloading' && phase.type !== 'failed') return;
+    if (activeReloadAttempt === null && !phase.fallbackReloadPending) return;
+    const record = phase.record;
+    cancelReloadAttempt();
+    phase = { type: 'waiting', record };
+    failureState.value = null;
+    stopPageLoading();
+  }
+
+  function showFailure(
+    activeContext: InstallContext,
+    record: RecoveryRecord,
+    fallbackReloadPending = false,
+  ): void {
+    cancelReloadAttempt();
+    phase = { type: 'failed', record, fallbackReloadPending };
     failureState.value = { canStay: activeContext.successfulRouteSettled };
   }
 
   function startReload(activeContext: InstallContext, record: RecoveryRecord): void {
-    phase = { type: 'reloading', record };
+    phase = { type: 'reloading', record, fallbackReloadPending: false };
     failureState.value = null;
-    pageHideObserved = false;
+    const reloadAttempt: ReloadAttempt = { record };
+    activeReloadAttempt = reloadAttempt;
 
+    let navigationCommitted: Promise<NavigationHistoryEntry> | undefined;
     try {
-      reloadPage();
+      const navigation = getNavigation();
+      if (navigation !== undefined && navigation.currentEntry !== null) {
+        const { committed, finished } = navigation.reload();
+        navigationCommitted = committed;
+        void finished?.catch(() => undefined);
+      } else {
+        reloadPage();
+      }
     } catch {
-      showFailure(activeContext, record);
+      showFailure(activeContext, reloadAttempt.record);
       return;
     }
 
-    if (pageHideObserved) return;
-    reloadUnloadCheckTimer = window.setTimeout(() => {
-      reloadUnloadCheckTimer = undefined;
-      showFailure(activeContext, record);
-    }, RELOAD_UNLOAD_CHECK_DELAY_MS);
+    if (activeReloadAttempt !== reloadAttempt) return;
+    if (navigationCommitted !== undefined) {
+      void navigationCommitted.catch(() => {
+        if (activeReloadAttempt === reloadAttempt) {
+          showFailure(activeContext, reloadAttempt.record);
+        }
+      });
+      return;
+    }
+
+    // 旧浏览器无法区分 reload 被 beforeunload 取消与入口响应缓慢。超时只展示
+    // 恢复入口；只有用户明确留页、重试或改为其他导航时才停止待处理刷新。
+    phase = { type: 'reloading', record, fallbackReloadPending: true };
+    fallbackReloadStatusTimer = window.setTimeout(() => {
+      fallbackReloadStatusTimer = undefined;
+      if (activeReloadAttempt === reloadAttempt) {
+        showFailure(activeContext, reloadAttempt.record, true);
+      }
+    }, FALLBACK_RELOAD_STATUS_DELAY_MS);
   }
 
   function runWaitingReload(activeContext: InstallContext): void {
@@ -219,12 +314,13 @@ export function createChunkLoadRecovery({
       consumeStartupRecovery(activeContext);
     }
 
-    if (
+    const shouldCancel =
       phase.type === 'waiting' ||
-      phase.type === 'failed' ||
-      (cancelReloadInProgress && phase.type === 'reloading')
-    ) {
-      cancelReloadUnloadCheck();
+      (phase.type === 'failed' && (!phase.fallbackReloadPending || cancelReloadInProgress)) ||
+      (cancelReloadInProgress && phase.type === 'reloading');
+    if (shouldCancel) {
+      stopPendingPageLoad();
+      cancelReloadAttempt();
       removeRecoveryRecord();
       phase = { type: 'idle' };
       failureState.value = null;
@@ -250,8 +346,18 @@ export function createChunkLoadRecovery({
   }
 
   function requestRecovery(activeContext: InstallContext, record: RecoveryRecord): void {
-    if (phase.type !== 'idle') return;
     const effectiveRecord = activeContext.startupRecovery?.record ?? record;
+    if (phase.type !== 'idle') {
+      if (writeRecoveryRecord(effectiveRecord)) {
+        phase = { ...phase, record: effectiveRecord };
+        if (activeReloadAttempt !== null) activeReloadAttempt.record = effectiveRecord;
+      } else {
+        stopPendingPageLoad();
+        removeRecoveryRecord();
+        showFailure(activeContext, effectiveRecord);
+      }
+      return;
+    }
 
     if (activeContext.automaticReload !== 'available') {
       writeRecoveryRecord(effectiveRecord);
@@ -297,12 +403,25 @@ export function createChunkLoadRecovery({
     recoveryMode: NavigationMode,
     resume: boolean,
   ): { intent: NavigationIntent; promise: NavigationPromise } {
+    const pendingFallbackFailure =
+      !resume && phase.type === 'failed' && phase.fallbackReloadPending ? phase : null;
     if (!resume) cancelRecoverableNavigation(activeContext);
+
+    const consumePendingFallbackFailure = (intent?: NavigationIntent): void => {
+      if (
+        pendingFallbackFailure !== null &&
+        phase === pendingFallbackFailure &&
+        !intent?.superseded
+      ) {
+        cancelRecoverableNavigation(activeContext, true);
+      }
+    };
 
     let target: string;
     try {
       target = activeContext.router.resolve(to).fullPath;
     } catch (error) {
+      consumePendingFallbackFailure();
       notifyUnexpected(activeContext, error);
       throw error;
     }
@@ -310,6 +429,7 @@ export function createChunkLoadRecovery({
     const intent: NavigationIntent = {
       target,
       mode: recoveryMode,
+      order: ++activeContext.latestNavigationOrder,
       resume,
       superseded: false,
       chunkFailed: false,
@@ -322,18 +442,31 @@ export function createChunkLoadRecovery({
       routerPromise = activeContext.router[callMode](to);
     } catch (error) {
       finishIntent(activeContext, intent);
+      consumePendingFallbackFailure(intent);
       notifyUnexpected(activeContext, error, intent);
       throw error;
     }
+    activeContext.latestNavigationAttempt = { type: 'intent', intent };
 
     const promise = routerPromise.then(
       (result) => {
         finishIntent(activeContext, intent);
+        if (
+          context === activeContext &&
+          phase.type !== 'idle' &&
+          !intent.superseded &&
+          (isNavigationFailure(result, NavigationFailureType.aborted) ||
+            isNavigationFailure(result, NavigationFailureType.duplicated))
+        ) {
+          cancelRecoverableNavigation(activeContext, true);
+        }
+        consumePendingFallbackFailure(intent);
         return result;
       },
       (error: unknown) => {
         finishIntent(activeContext, intent);
         if (intent.chunkFailed) return undefined;
+        consumePendingFallbackFailure(intent);
         notifyUnexpected(activeContext, error, intent);
         throw error;
       },
@@ -358,7 +491,11 @@ export function createChunkLoadRecovery({
       // 完成是这一路径消费记录的最终屏障。chunk 失败则必须保留记录供手动重试。
       void navigation.promise.then(
         () => {
-          if (!navigation.intent.chunkFailed && activeContext.startupRecovery === startupRecovery) {
+          if (
+            context === activeContext &&
+            !navigation.intent.chunkFailed &&
+            activeContext.startupRecovery === startupRecovery
+          ) {
             consumeStartupRecovery(activeContext);
           }
         },
@@ -382,7 +519,10 @@ export function createChunkLoadRecovery({
       onUnexpectedNavigationError,
       preloadErrors: new WeakSet<Error>(),
       routeIntents: new WeakMap<object, NavigationIntent>(),
+      routeNavigationOrders: new WeakMap<object, number>(),
       intents: new Set<NavigationIntent>(),
+      latestNavigationOrder: 0,
+      latestNavigationAttempt: null,
       startupRecovery: startupRecord === null ? null : { record: startupRecord },
       automaticReload: startupRecord === null ? 'available' : 'recorded',
       successfulRouteSettled: false,
@@ -391,17 +531,41 @@ export function createChunkLoadRecovery({
     phase = { type: 'idle' };
     failureState.value = null;
     reloadDeferrals = 0;
-    pageHideObserved = false;
+    activeReloadAttempt = null;
 
     const handlePreloadError = (event: VitePreloadErrorEvent) => {
       activeContext.preloadErrors.add(event.payload);
     };
     const handlePageHide = () => {
-      pageHideObserved = true;
-      cancelReloadUnloadCheck();
+      cancelReloadAttempt();
+      clearPendingFallbackReload();
     };
+    const removeHistoryNavigation = router.options.history.listen((to) => {
+      activeContext.latestNavigationAttempt = {
+        type: 'history',
+        target: router.resolve(to).fullPath,
+        order: ++activeContext.latestNavigationOrder,
+        route: null,
+      };
+      supersedeOtherIntents(activeContext);
+    });
     const removeBeforeEach = router.beforeEach((to) => {
+      const latestNavigationAttempt = activeContext.latestNavigationAttempt;
       const intent = findIntent(activeContext, to);
+      let navigationOrder: number;
+      if (
+        latestNavigationAttempt?.type === 'history' &&
+        latestNavigationAttempt.route === null &&
+        [to.fullPath, to.redirectedFrom?.fullPath].includes(latestNavigationAttempt.target)
+      ) {
+        latestNavigationAttempt.route = to;
+        navigationOrder = latestNavigationAttempt.order;
+      } else if (intent !== undefined) {
+        navigationOrder = intent.order;
+      } else {
+        navigationOrder = ++activeContext.latestNavigationOrder;
+      }
+      activeContext.routeNavigationOrders.set(to, navigationOrder);
       if (intent !== undefined) activeContext.routeIntents.set(to, intent);
       supersedeOtherIntents(activeContext, intent);
       const resumeIntent = activeContext.startupRecovery?.intent;
@@ -411,9 +575,19 @@ export function createChunkLoadRecovery({
     });
     const removeError = router.onError((error, to) => {
       const intent = activeContext.routeIntents.get(to);
-      if (error instanceof Error && activeContext.preloadErrors.has(error)) {
+      const navigationOrder = activeContext.routeNavigationOrders.get(to);
+      if (
+        error instanceof Error &&
+        activeContext.preloadErrors.has(error) &&
+        isResourcePreloadError(error)
+      ) {
         if (intent) intent.chunkFailed = true;
-        if (intent?.superseded) return;
+        if (
+          intent?.superseded ||
+          (navigationOrder !== undefined && navigationOrder < activeContext.latestNavigationOrder)
+        ) {
+          return;
+        }
         requestRecovery(activeContext, {
           version: RECOVERY_RECORD_VERSION,
           target: intent?.target ?? to.redirectedFrom?.fullPath ?? to.fullPath,
@@ -427,9 +601,29 @@ export function createChunkLoadRecovery({
     });
     const removeAfterEach = router.afterEach((to, _from, failure) => {
       const intent = activeContext.routeIntents.get(to);
+      const latestNavigationAttempt = activeContext.latestNavigationAttempt;
+      const isCurrentAbortedNavigation =
+        intent === undefined
+          ? latestNavigationAttempt !== null &&
+            latestNavigationAttempt.type === 'history' &&
+            (latestNavigationAttempt.route === to ||
+              (latestNavigationAttempt.route === null &&
+                [to.fullPath, to.redirectedFrom?.fullPath].includes(
+                  latestNavigationAttempt.target,
+                )))
+          : !intent.superseded;
       if (!failure) activeContext.successfulRouteSettled = true;
 
-      if (!failure && intent === undefined && phase.type !== 'idle') {
+      if (
+        phase.type !== 'idle' &&
+        isCurrentAbortedNavigation &&
+        isNavigationFailure(failure, NavigationFailureType.aborted)
+      ) {
+        cancelRecoverableNavigation(activeContext, true);
+        return;
+      }
+
+      if (!failure && phase.type !== 'idle' && (intent === undefined || !intent.resume)) {
         cancelRecoverableNavigation(activeContext, true);
         return;
       }
@@ -465,7 +659,8 @@ export function createChunkLoadRecovery({
       active = false;
       window.removeEventListener('vite:preloadError', handlePreloadError);
       window.removeEventListener('pagehide', handlePageHide);
-      cancelReloadUnloadCheck();
+      cancelReloadAttempt();
+      removeHistoryNavigation();
       removeBeforeEach();
       removeAfterEach();
       removeError();
@@ -474,7 +669,7 @@ export function createChunkLoadRecovery({
       phase = { type: 'idle' };
       failureState.value = null;
       reloadDeferrals = 0;
-      pageHideObserved = false;
+      activeReloadAttempt = null;
     };
   }
 
@@ -498,6 +693,7 @@ export function createChunkLoadRecovery({
     const activeContext = activeInstall();
     const leaseGeneration = activeContext.generation;
     reloadDeferrals += 1;
+    if (reloadDeferrals === 1) pausePendingReload();
     let released = false;
 
     return () => {
@@ -513,6 +709,7 @@ export function createChunkLoadRecovery({
     const activeContext = context;
     if (activeContext === null || phase.type !== 'failed') return;
     const record = phase.record;
+    stopPendingPageLoad();
     writeRecoveryRecord(record);
     phase = { type: 'waiting', record };
     failureState.value = null;
@@ -522,6 +719,7 @@ export function createChunkLoadRecovery({
   function stayOnCurrentPage(): void {
     const activeContext = context;
     if (activeContext === null || phase.type !== 'failed' || !failureState.value?.canStay) return;
+    stopPendingPageLoad();
     removeRecoveryRecord();
     activeContext.startupRecovery = null;
     activeContext.automaticReload = 'disabled';
