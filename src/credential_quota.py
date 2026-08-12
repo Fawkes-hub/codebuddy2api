@@ -13,7 +13,8 @@ from typing import Any, Callable, Dict, Iterable, Optional
 
 import httpx
 
-from config import get_codebuddy_api_endpoint
+from config import get_codebuddy_api_endpoint, get_credential_background_delay_range
+from .background_request_pacer import BackgroundRequestPacer
 from .codebuddy_api_client import codebuddy_api_client
 from .codebuddy_token_manager import CodeBuddyTokenManagerRegistry, codebuddy_token_managers
 from .stream_service import get_http_client
@@ -107,19 +108,24 @@ class CredentialQuotaManager:
             usernames_provider: Callable[[], Iterable[str]] = users_store.list_usernames,
             http_client_factory: Callable[[], Any] = get_http_client,
             now_factory: Callable[[], float] = time.time,
+            monotonic_factory: Callable[[], float] = time.monotonic,
             interval_seconds: float = QUOTA_REFRESH_INTERVAL_SECONDS,
             max_concurrency: int = QUOTA_MAX_CONCURRENCY,
+            background_pacer: Optional[BackgroundRequestPacer] = None,
     ) -> None:
         self._registry = registry
         self._usernames_provider = usernames_provider
         self._http_client_factory = http_client_factory
         self._now_factory = now_factory
+        self._monotonic_factory = monotonic_factory
         self._interval_seconds = interval_seconds
         self._max_concurrency = max_concurrency
+        self._background_pacer = background_pacer or BackgroundRequestPacer(0, 0)
         self._cache: Dict[str, Dict[str, Any]] = {}
         self._usage_totals: Dict[str, float] = {}
         self._invalidations: Dict[str, int] = {}
         self._inflight: Dict[str, asyncio.Task] = {}
+        self._background_probes: set[asyncio.Task] = set()
         self._scheduled: set[asyncio.Task] = set()
         self._lock = threading.RLock()
         self._task: Optional[asyncio.Task] = None
@@ -140,6 +146,7 @@ class CredentialQuotaManager:
     async def startup(self) -> None:
         if self._task is not None:
             raise RuntimeError("credential quota manager is already running")
+        self._background_pacer.reset()
         self._stop_event = asyncio.Event()
         self._task = asyncio.create_task(self._run())
 
@@ -149,14 +156,21 @@ class CredentialQuotaManager:
         if task is None or stop_event is None:
             return
         stop_event.set()
+        task.cancel()
         try:
-            await task
+            await asyncio.gather(task, return_exceptions=True)
         finally:
             scheduled = tuple(self._scheduled)
             for item in scheduled:
                 item.cancel()
             if scheduled:
                 await asyncio.gather(*scheduled, return_exceptions=True)
+            background_probes = tuple(self._background_probes)
+            for item in background_probes:
+                item.cancel()
+            if background_probes:
+                await asyncio.gather(*background_probes, return_exceptions=True)
+            self._background_probes.clear()
             inflight = tuple(set(self._inflight.values()))
             for item in inflight:
                 item.cancel()
@@ -167,23 +181,33 @@ class CredentialQuotaManager:
             self._stop_event = None
 
     async def _run(self) -> None:
+        apply_background_pacing = False
         while True:
+            scan_started_at = self._monotonic_factory()
             try:
-                await self.scan_once()
+                await self.scan_once(
+                    apply_background_pacing=apply_background_pacing,
+                )
             except Exception:
                 logger.exception("CodeBuddy 凭证额度后台扫描失败")
+            apply_background_pacing = True
             if self._stop_event.is_set():
                 return
+            elapsed = max(0.0, self._monotonic_factory() - scan_started_at)
+            remaining = max(0.0, self._interval_seconds - elapsed)
+            if remaining == 0:
+                continue
             try:
                 await asyncio.wait_for(
                     self._stop_event.wait(),
-                    timeout=self._interval_seconds,
+                    timeout=remaining,
                 )
                 return
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 pass
 
-    async def scan_once(self) -> None:
+    async def scan_once(self, *, apply_background_pacing: bool = True) -> None:
+        """扫描全部有效凭证；应用启动首轮可显式跳过后台请求节流。"""
         semaphore = asyncio.Semaphore(self._max_concurrency)
         jobs = []
         for username in self._usernames_provider():
@@ -193,21 +217,96 @@ class CredentialQuotaManager:
                 if not credential_id or info.get("is_expired"):
                     continue
                 jobs.append(self._probe_with_semaphore(
-                    semaphore, username, manager, credential_id,
+                    semaphore,
+                    username,
+                    manager,
+                    credential_id,
+                    apply_background_pacing=apply_background_pacing,
                 ))
         if jobs:
             await asyncio.gather(*jobs)
 
-    async def _probe_with_semaphore(self, semaphore, username, manager, credential_id):
+    async def _probe_with_semaphore(
+            self,
+            semaphore,
+            username,
+            manager,
+            credential_id,
+            *,
+            apply_background_pacing: bool,
+    ):
         async with semaphore:
-            await self.probe_credential(username, manager, credential_id)
+            key = self._cache_key(username, credential_id)
+            existing = self._inflight.get(key)
+            if existing is not None:
+                return await asyncio.shield(existing)
+            if not apply_background_pacing:
+                return await self.probe_credential(
+                    username,
+                    manager,
+                    credential_id,
+                )
 
-    async def probe_credential(self, username, manager, credential_id):
+            task = asyncio.create_task(
+                self._perform_background_probe(
+                    username,
+                    manager,
+                    credential_id,
+                    key,
+                ),
+            )
+            self._background_probes.add(task)
+            task.add_done_callback(self._remove_completed_background_probe)
+            return await asyncio.shield(task)
+
+    async def _perform_background_probe(
+            self,
+            username,
+            manager,
+            credential_id,
+            key,
+    ):
+        async with self._background_pacer.turn() as mark_started:
+            existing = self._inflight.get(key)
+            if existing is None:
+                task = asyncio.current_task()
+                self._inflight[key] = task
+                task.add_done_callback(
+                    lambda completed: self._remove_completed_inflight(key, completed)
+                )
+                return await self._perform_probe(
+                    username,
+                    manager,
+                    credential_id,
+                    key,
+                    _mark_started=mark_started,
+                )
+        return await asyncio.shield(existing)
+
+    def _remove_completed_background_probe(self, task: asyncio.Task) -> None:
+        if not task.cancelled():
+            task.exception()
+        self._background_probes.discard(task)
+
+    async def probe_credential(
+            self,
+            username,
+            manager,
+            credential_id,
+            *,
+            _mark_started: Optional[Callable[[], None]] = None,
+    ):
         key = self._cache_key(username, credential_id)
         existing = self._inflight.get(key)
         if existing is None:
             existing = asyncio.create_task(
-                self._perform_probe(username, manager, credential_id, key),
+                self._perform_probe(
+                    username,
+                    manager,
+                    credential_id,
+                    key,
+                    _mark_started=_mark_started,
+                ),
             )
             self._inflight[key] = existing
             existing.add_done_callback(
@@ -221,7 +320,15 @@ class CredentialQuotaManager:
         if self._inflight.get(key) is task:
             self._inflight.pop(key, None)
 
-    async def _perform_probe(self, username, manager, credential_id, key):
+    async def _perform_probe(
+            self,
+            username,
+            manager,
+            credential_id,
+            key,
+            *,
+            _mark_started: Optional[Callable[[], None]] = None,
+    ):
         credential = manager.get_credential_by_id(credential_id)
         if credential is None or manager.is_token_expired(credential):
             return None
@@ -231,7 +338,13 @@ class CredentialQuotaManager:
             invalidation_at_start = self._invalidations.get(key, 0)
         attempted_at = int(self._now_factory())
         try:
-            snapshot = await self._fetch_quota(credential)
+            if _mark_started is None:
+                snapshot = await self._fetch_quota(credential)
+            else:
+                snapshot = await self._fetch_quota(
+                    credential,
+                    _mark_started=_mark_started,
+                )
         except CredentialQuotaProbeError as error:
             return self._record_failure(
                 key, attempted_at, str(error), invalidation_at_start, quota_type,
@@ -267,7 +380,12 @@ class CredentialQuotaManager:
             self._cache[key] = entry
             return deepcopy(entry)
 
-    async def _fetch_quota(self, credential: Dict[str, Any]) -> Dict[str, Any]:
+    async def _fetch_quota(
+            self,
+            credential: Dict[str, Any],
+            *,
+            _mark_started: Optional[Callable[[], None]] = None,
+    ) -> Dict[str, Any]:
         bearer_token = credential.get("bearer_token")
         if not bearer_token:
             raise CredentialQuotaProbeError("authentication_error")
@@ -299,8 +417,11 @@ class CredentialQuotaManager:
                 "PackageEndTimeRangeEnd": QUOTA_RANGE_END,
             }
         client = await self._get_http_client()
+        url = f"{get_codebuddy_api_endpoint()}{path}"
+        if _mark_started is not None:
+            _mark_started()
         response = await client.post(
-            f"{get_codebuddy_api_endpoint()}{path}",
+            url,
             json=payload,
             headers=headers,
             timeout=httpx.Timeout(30.0, connect=10.0, read=30.0),
@@ -531,4 +652,8 @@ class CredentialQuotaManager:
             }
 
 
-credential_quota_manager = CredentialQuotaManager()
+credential_quota_manager = CredentialQuotaManager(
+    background_pacer=BackgroundRequestPacer(
+        *get_credential_background_delay_range(),
+    ),
+)

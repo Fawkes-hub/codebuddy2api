@@ -349,6 +349,8 @@ class ConfigTests(ConfigIsolationMixin, unittest.TestCase):
             "CODEBUDDY_LOGIN_USERNAME_MAX_ATTEMPTS": "invalid",
             "CODEBUDDY_LOGIN_MAX_CONCURRENCY": "0",
             "CODEBUDDY_MAX_CONCURRENT_REQUESTS": "0",
+            "CODEBUDDY_CREDENTIAL_BACKGROUND_DELAY_MIN_SECONDS": "invalid",
+            "CODEBUDDY_CREDENTIAL_BACKGROUND_DELAY_MAX_SECONDS": "nan",
         }
         for key, value in cases.items():
             with self.subTest(key=key):
@@ -375,6 +377,42 @@ class ConfigTests(ConfigIsolationMixin, unittest.TestCase):
         config._config_cache["CODEBUDDY_MAX_CONCURRENT_REQUESTS"] = True
         with self.assertRaisesRegex(ValueError, "positive integer"):
             config.get_max_concurrent_requests()
+
+    def test_credential_background_delay_range_is_strict_and_can_be_disabled(self):
+        self.assertEqual(config.get_credential_background_delay_range(), (5.0, 20.0))
+
+        for minimum, maximum, expected in (
+            ("0", "0", (0.0, 0.0)),
+            ("1.5", 9, (1.5, 9.0)),
+            (7, "7", (7.0, 7.0)),
+        ):
+            with self.subTest(minimum=minimum, maximum=maximum):
+                config._config_cache["CODEBUDDY_CREDENTIAL_BACKGROUND_DELAY_MIN_SECONDS"] = minimum
+                config._config_cache["CODEBUDDY_CREDENTIAL_BACKGROUND_DELAY_MAX_SECONDS"] = maximum
+                self.assertEqual(config.get_credential_background_delay_range(), expected)
+
+        for key, value in (
+            ("CODEBUDDY_CREDENTIAL_BACKGROUND_DELAY_MIN_SECONDS", True),
+            ("CODEBUDDY_CREDENTIAL_BACKGROUND_DELAY_MIN_SECONDS", ""),
+            ("CODEBUDDY_CREDENTIAL_BACKGROUND_DELAY_MIN_SECONDS", "nan"),
+            ("CODEBUDDY_CREDENTIAL_BACKGROUND_DELAY_MAX_SECONDS", "inf"),
+            ("CODEBUDDY_CREDENTIAL_BACKGROUND_DELAY_MAX_SECONDS", -1),
+            ("CODEBUDDY_CREDENTIAL_BACKGROUND_DELAY_MAX_SECONDS", "invalid"),
+        ):
+            with self.subTest(key=key, value=value):
+                config._config_cache["CODEBUDDY_CREDENTIAL_BACKGROUND_DELAY_MIN_SECONDS"] = 5
+                config._config_cache["CODEBUDDY_CREDENTIAL_BACKGROUND_DELAY_MAX_SECONDS"] = 20
+                config._config_cache[key] = value
+                with self.assertRaisesRegex(ValueError, key):
+                    config.get_credential_background_delay_range()
+
+        config._config_cache["CODEBUDDY_CREDENTIAL_BACKGROUND_DELAY_MIN_SECONDS"] = 21
+        config._config_cache["CODEBUDDY_CREDENTIAL_BACKGROUND_DELAY_MAX_SECONDS"] = 20
+        with self.assertRaisesRegex(
+                ValueError,
+                "CODEBUDDY_CREDENTIAL_BACKGROUND_DELAY_MIN_SECONDS",
+        ):
+            config.get_credential_background_delay_range()
 
     def test_strip_model_namespace_defaults_to_enabled_but_empty_disables(self):
         self.assertIs(config._DEFAULT_CONFIG["CODEBUDDY_STRIP_MODEL_NAMESPACE"], True)

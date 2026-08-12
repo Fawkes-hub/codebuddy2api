@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 import httpx
 import config
 
+from src.background_request_pacer import BackgroundRequestPacer
 from src.codebuddy_token_manager import CodeBuddyTokenManagerRegistry
 from src.credential_checkin import (
     _AccountGate,
@@ -45,6 +46,19 @@ class FakeClient:
         if isinstance(response, BaseException):
             raise response
         return response
+
+
+class _FakeMonotonicClock:
+    def __init__(self):
+        self.now = 0.0
+        self.sleeps = []
+
+    def monotonic(self):
+        return self.now
+
+    async def sleep(self, delay):
+        self.sleeps.append(delay)
+        self.now += delay
 
 
 class CredentialCheckinStoreTests(unittest.TestCase):
@@ -1039,3 +1053,177 @@ class CredentialCheckinManagerTests(ConfigIsolationMixin, unittest.IsolatedAsync
 
         with mock.patch("src.credential_checkin.asyncio.wait_for", side_effect=immediate_wait):
             await manager._run()
+
+    async def test_background_checkins_share_pacing_across_users_and_cycles_but_manual_bypasses_it(self):
+        bob_manager = self.registry.for_username("bob")
+        self.assertTrue(bob_manager.add_credential_with_data(
+            {"bearer_token": "bob-token", "user_id": "bob-upstream"},
+            "bob.json",
+        ))
+        clock = _FakeMonotonicClock()
+        starts = []
+
+        class TimedClient:
+            async def post(_self, _url, **_kwargs):
+                starts.append(clock.now)
+                return FakeResponse({"code": 7, "msg": "failed"})
+
+        pacer = BackgroundRequestPacer(
+            5,
+            5,
+            uniform_factory=lambda _minimum, _maximum: 5.0,
+            monotonic_factory=clock.monotonic,
+            sleep=clock.sleep,
+        )
+        manager = CredentialCheckinManager(
+            registry=self.registry,
+            usernames_provider=lambda: ("alice", "bob"),
+            http_client_factory=TimedClient,
+            store=self.store,
+            now_factory=lambda: self.now,
+            timezone=self.zone,
+            auto_enabled_provider=lambda _username: True,
+            background_pacer=pacer,
+        )
+
+        await manager.run_daily_cycle(startup_compensation=False)
+        await manager.run_daily_cycle(startup_compensation=False)
+        await manager.manual_checkin("alice", self.token_manager, self.credential_id)
+
+        self.assertEqual(starts, [0.0, 5.0, 10.0, 15.0, 15.0])
+        self.assertEqual(clock.sleeps, [5.0, 5.0, 5.0])
+
+    async def test_locally_invalid_automatic_checkin_does_not_consume_interval(self):
+        self.token_manager.get_credential_by_id(
+            self.credential_id,
+        )["department_full_name"] = "invalid\nheader"
+        bob_manager = self.registry.for_username("bob")
+        self.assertTrue(bob_manager.add_credential_with_data(
+            {"bearer_token": "bob-token", "user_id": "bob-upstream"},
+            "bob.json",
+        ))
+        clock = _FakeMonotonicClock()
+        starts = []
+
+        class TimedClient:
+            async def post(_self, _url, **_kwargs):
+                starts.append(clock.now)
+                return FakeResponse({"code": 7, "msg": "failed"})
+
+        manager = CredentialCheckinManager(
+            registry=self.registry,
+            usernames_provider=lambda: ("alice", "bob"),
+            http_client_factory=TimedClient,
+            store=self.store,
+            now_factory=lambda: self.now,
+            timezone=self.zone,
+            auto_enabled_provider=lambda _username: True,
+            background_pacer=BackgroundRequestPacer(
+                5,
+                5,
+                uniform_factory=lambda _minimum, _maximum: 5.0,
+                monotonic_factory=clock.monotonic,
+                sleep=clock.sleep,
+            ),
+        )
+
+        await manager.run_daily_cycle(startup_compensation=False)
+
+        self.assertEqual(starts, [0.0])
+        self.assertEqual(clock.sleeps, [])
+
+    async def test_automatic_start_is_marked_after_client_preparation_before_post(self):
+        events = []
+
+        class OrderedClient:
+            async def post(_self, _url, **_kwargs):
+                events.append("post")
+                return FakeResponse({"code": 7, "msg": "failed"})
+
+        async def client_factory():
+            events.append("client")
+            return OrderedClient()
+
+        manager, _client = self.manager([], http_client_factory=client_factory)
+        credential = self.token_manager.get_credential_by_id(self.credential_id)
+
+        await manager._perform_checkin(
+            "alice",
+            "account",
+            credential,
+            _mark_started=lambda: events.append("mark"),
+        )
+
+        self.assertEqual(events, ["client", "mark", "post"])
+
+    async def test_pacing_wait_does_not_claim_account_before_manual_checkin(self):
+        now = 0.0
+        sleep_started = asyncio.Event()
+        release_sleep = asyncio.Event()
+
+        async def blocking_sleep(_delay):
+            sleep_started.set()
+            await release_sleep.wait()
+
+        pacer = BackgroundRequestPacer(
+            20,
+            20,
+            uniform_factory=lambda _minimum, _maximum: 20.0,
+            monotonic_factory=lambda: now,
+            sleep=blocking_sleep,
+        )
+        async with pacer.turn() as mark_started:
+            mark_started()
+        manager, client = self.manager([
+            FakeResponse({"code": 0, "msg": "OK", "data": {"credit": 1}}),
+        ], background_pacer=pacer)
+
+        automatic = asyncio.create_task(manager.automatic_checkin(
+            "alice", self.token_manager, self.credential_id,
+        ))
+        await sleep_started.wait()
+        manual = await asyncio.wait_for(
+            manager.manual_checkin("alice", self.token_manager, self.credential_id),
+            timeout=0.1,
+        )
+        self.assertTrue(manual["success"])
+        self.assertEqual(len(client.requests), 1)
+
+        now = 20.0
+        release_sleep.set()
+        automatic_result = await automatic
+        self.assertTrue(automatic_result["success"])
+        self.assertEqual(len(client.requests), 1)
+
+    async def test_shutdown_cancels_daily_cycle_waiting_for_background_interval(self):
+        bob_manager = self.registry.for_username("bob")
+        self.assertTrue(bob_manager.add_credential_with_data(
+            {"bearer_token": "bob-token", "user_id": "bob-upstream"},
+            "bob.json",
+        ))
+        sleep_started = asyncio.Event()
+        release_sleep = asyncio.Event()
+
+        async def blocking_sleep(_delay):
+            sleep_started.set()
+            await release_sleep.wait()
+
+        pacer = BackgroundRequestPacer(
+            10,
+            10,
+            uniform_factory=lambda _minimum, _maximum: 10.0,
+            monotonic_factory=lambda: 0.0,
+            sleep=blocking_sleep,
+        )
+        manager, client = self.manager(
+            [FakeResponse({"code": 7, "msg": "failed"})],
+            usernames_provider=lambda: ("alice", "bob"),
+            background_pacer=pacer,
+        )
+        await manager.startup()
+        await sleep_started.wait()
+
+        await asyncio.wait_for(manager.shutdown(), timeout=0.1)
+
+        self.assertEqual(len(client.requests), 1)
+        self.assertIsNone(manager._task)

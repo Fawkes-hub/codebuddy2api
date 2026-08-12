@@ -17,8 +17,10 @@ import httpx
 from config import (
     get_auto_checkin_enabled,
     get_codebuddy_api_endpoint,
+    get_credential_background_delay_range,
     get_database_path,
 )
+from .background_request_pacer import BackgroundRequestPacer
 from .codebuddy_api_client import codebuddy_api_client
 from .codebuddy_token_manager import CodeBuddyTokenManagerRegistry, codebuddy_token_managers
 from .credential_quota import CredentialQuotaManager, credential_quota_manager
@@ -167,6 +169,7 @@ class CredentialCheckinManager:
             max_concurrency: int = CHECKIN_MAX_CONCURRENCY,
             auto_enabled_provider: Callable[[str], bool] = get_auto_checkin_enabled,
             quota_manager: CredentialQuotaManager = credential_quota_manager,
+            background_pacer: Optional[BackgroundRequestPacer] = None,
     ) -> None:
         self._registry = registry
         self._usernames_provider = usernames_provider
@@ -177,6 +180,7 @@ class CredentialCheckinManager:
         self._max_concurrency = max_concurrency
         self._auto_enabled_provider = auto_enabled_provider
         self._quota_manager = quota_manager
+        self._background_pacer = background_pacer or BackgroundRequestPacer(0, 0)
         self._gates: Dict[str, _AccountGate] = {}
         self._inflight_checkins: set[asyncio.Task] = set()
         self._task: Optional[asyncio.Task] = None
@@ -308,6 +312,8 @@ class CredentialCheckinManager:
             username: str,
             account_key: str,
             credential: Dict[str, Any],
+            *,
+            _mark_started: Optional[Callable[[], None]] = None,
     ) -> Dict[str, Any]:
         attempted_at = int(self._now_factory())
         bearer_token = credential.get("bearer_token")
@@ -321,8 +327,11 @@ class CredentialCheckinManager:
                 department_full_name=credential.get("department_full_name"),
             )
             client = await self._get_http_client()
+            url = f"{get_codebuddy_api_endpoint()}/billing/meter/daily-checkin"
+            if _mark_started is not None:
+                _mark_started()
             response = await client.post(
-                f"{get_codebuddy_api_endpoint()}/billing/meter/daily-checkin",
+                url,
                 json={},
                 headers=headers,
                 timeout=httpx.Timeout(30.0, connect=10.0, read=30.0),
@@ -373,17 +382,39 @@ class CredentialCheckinManager:
         self._store.save(record)
         return self._public_detail(record)
 
-    async def _checkin(self, source: str, username: str, manager, credential_id: str):
+    async def _checkin(
+            self,
+            source: str,
+            username: str,
+            manager,
+            credential_id: str,
+            *,
+            _mark_started: Optional[Callable[[], None]] = None,
+    ):
         if self._stopping:
             raise CredentialCheckinConflict("shutting_down")
         task = asyncio.current_task()
         self._inflight_checkins.add(task)
         try:
-            return await self._checkin_once(source, username, manager, credential_id)
+            return await self._checkin_once(
+                source,
+                username,
+                manager,
+                credential_id,
+                _mark_started=_mark_started,
+            )
         finally:
             self._inflight_checkins.discard(task)
 
-    async def _checkin_once(self, source: str, username: str, manager, credential_id: str):
+    async def _checkin_once(
+            self,
+            source: str,
+            username: str,
+            manager,
+            credential_id: str,
+            *,
+            _mark_started: Optional[Callable[[], None]] = None,
+    ):
         credential, account_key = self._eligible_snapshot(manager, credential_id)
         gate = self._gates.setdefault(
             self._gate_key(username, account_key), _AccountGate(),
@@ -414,7 +445,10 @@ class CredentialCheckinManager:
                 result = None
             else:
                 result = await self._perform_checkin(
-                    username, account_key, current_credential,
+                    username,
+                    account_key,
+                    current_credential,
+                    _mark_started=_mark_started,
                 )
                 if result["code"] == 0 and result.get("credit") is not None:
                     refresh_tasks = self._refresh_account_quotas(
@@ -438,7 +472,14 @@ class CredentialCheckinManager:
 
     async def automatic_checkin(self, username: str, manager, credential_id: str):
         try:
-            return await self._checkin("auto", username, manager, credential_id)
+            async with self._background_pacer.turn() as mark_started:
+                return await self._checkin(
+                    "auto",
+                    username,
+                    manager,
+                    credential_id,
+                    _mark_started=mark_started,
+                )
         except CredentialCheckinConflict as error:
             if str(error) == "shutting_down":
                 raise
@@ -498,6 +539,7 @@ class CredentialCheckinManager:
         if self._task is not None:
             raise RuntimeError("credential checkin manager is already running")
         self._stopping = False
+        self._background_pacer.reset()
         self._stop_event = asyncio.Event()
         self._task = asyncio.create_task(self._run(initial_scan_waiter))
 
@@ -551,4 +593,8 @@ class CredentialCheckinManager:
                     logger.exception("CodeBuddy 每日自动签到失败")
 
 
-credential_checkin_manager = CredentialCheckinManager()
+credential_checkin_manager = CredentialCheckinManager(
+    background_pacer=BackgroundRequestPacer(
+        *get_credential_background_delay_range(),
+    ),
+)

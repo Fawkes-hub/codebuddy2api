@@ -5,6 +5,7 @@ from unittest import mock
 import httpx
 
 import config
+from src.background_request_pacer import BackgroundRequestPacer
 from src.codebuddy_token_manager import CodeBuddyTokenManagerRegistry
 from src.credential_quota import CredentialQuotaManager, CredentialQuotaProbeError
 from tests.helpers import ConfigIsolationMixin
@@ -74,6 +75,19 @@ def package(**overrides):
         value.setdefault(cycle_key, source)
         value.setdefault(precise_key, str(source))
     return value
+
+
+class _FakeMonotonicClock:
+    def __init__(self):
+        self.now = 0.0
+        self.sleeps = []
+
+    def monotonic(self):
+        return self.now
+
+    async def sleep(self, delay):
+        self.sleeps.append(delay)
+        self.now += delay
 
 
 class CredentialQuotaManagerTests(ConfigIsolationMixin, unittest.IsolatedAsyncioTestCase):
@@ -492,6 +506,47 @@ class CredentialQuotaManagerTests(ConfigIsolationMixin, unittest.IsolatedAsyncio
         self.assertEqual(await first, await second)
         self.assertEqual(delayed_client.requests, 1)
 
+    async def test_startup_scan_bypasses_background_pacing(self):
+        self.assertTrue(self.manager.add_credential_with_data({
+            "bearer_token": "second-secret",
+            "user_id": "user-2",
+            "account_uid": "account-2",
+            "domain": "www.codebuddy.ai",
+        }, "second.json"))
+        clock = _FakeMonotonicClock()
+        starts = []
+        both_started = asyncio.Event()
+
+        class TimedClient:
+            async def post(_self, _url, **_kwargs):
+                starts.append(clock.now)
+                if len(starts) == 2:
+                    both_started.set()
+                return quota_response(package())
+
+        manager = CredentialQuotaManager(
+            registry=self.registry,
+            usernames_provider=lambda: ("admin",),
+            http_client_factory=TimedClient,
+            now_factory=lambda: 1_000,
+            background_pacer=BackgroundRequestPacer(
+                5,
+                5,
+                uniform_factory=lambda _minimum, _maximum: 5.0,
+                monotonic_factory=clock.monotonic,
+                sleep=clock.sleep,
+            ),
+        )
+
+        await manager.startup()
+        try:
+            await asyncio.wait_for(both_started.wait(), timeout=0.1)
+        finally:
+            await manager.shutdown()
+
+        self.assertEqual(starts, [0.0, 0.0])
+        self.assertEqual(clock.sleeps, [])
+
     async def test_transport_and_authentication_failures_are_controlled(self):
         manager, _client = self.quota_manager([
             httpx.ConnectError("private endpoint"),
@@ -539,10 +594,12 @@ class CredentialQuotaManagerTests(ConfigIsolationMixin, unittest.IsolatedAsyncio
     async def test_lifecycle_rejects_duplicate_recovers_scan_failure_and_cancels_event_probe(self):
         manager, _client = self.quota_manager([], interval_seconds=0)
         scans = 0
+        pacing_modes = []
 
-        async def scan_once():
+        async def scan_once(*, apply_background_pacing):
             nonlocal scans
             scans += 1
+            pacing_modes.append(apply_background_pacing)
             if scans == 1:
                 raise RuntimeError("scan")
             manager._stop_event.set()
@@ -555,6 +612,7 @@ class CredentialQuotaManagerTests(ConfigIsolationMixin, unittest.IsolatedAsyncio
             await manager._task
         await manager.shutdown()
         self.assertEqual(scans, 2)
+        self.assertEqual(pacing_modes, [False, True])
 
         blocking = CredentialQuotaManager(usernames_provider=lambda: ())
         release = asyncio.Event()
@@ -728,6 +786,388 @@ class CredentialQuotaManagerTests(ConfigIsolationMixin, unittest.IsolatedAsyncio
         updated = manager.get_quota("admin", "id")
         self.assertEqual(updated["remaining"], 49)
         self.assertIsInstance(updated["last_estimated_at"], int)
+
+    async def test_background_scans_share_pacing_across_users_and_cycles_but_events_bypass_it(self):
+        bob_manager = self.registry.for_username("bob")
+        self.assertTrue(bob_manager.add_credential_with_data({
+            "bearer_token": "bob-secret",
+            "user_id": "bob-user",
+            "account_uid": "bob-account",
+            "domain": "www.codebuddy.ai",
+        }, "bob.json"))
+        clock = _FakeMonotonicClock()
+        starts = []
+
+        class TimedClient:
+            async def post(_self, _url, **_kwargs):
+                starts.append(clock.now)
+                return quota_response(package())
+
+        pacer = BackgroundRequestPacer(
+            5,
+            5,
+            uniform_factory=lambda _minimum, _maximum: 5.0,
+            monotonic_factory=clock.monotonic,
+            sleep=clock.sleep,
+        )
+        manager = CredentialQuotaManager(
+            registry=self.registry,
+            usernames_provider=lambda: ("admin", "bob"),
+            http_client_factory=TimedClient,
+            now_factory=lambda: 1_000,
+            background_pacer=pacer,
+        )
+
+        await manager.scan_once()
+        await manager.scan_once()
+        await manager.probe_credential("admin", self.manager, self.credential_id)
+
+        self.assertEqual(starts, [0.0, 5.0, 10.0, 15.0, 15.0])
+        self.assertEqual(clock.sleeps, [5.0, 5.0, 5.0])
+
+    async def test_background_singleflight_join_does_not_block_other_probe_turns(self):
+        self.assertTrue(self.manager.add_credential_with_data({
+            "bearer_token": "second-secret",
+            "user_id": "user-2",
+            "account_uid": "account-2",
+            "domain": "www.codebuddy.ai",
+        }, "second.json"))
+        second_id = self.manager.get_credentials_info()[1]["credential_id"]
+        first_started = asyncio.Event()
+        second_started = asyncio.Event()
+        release_first = asyncio.Event()
+
+        class OverlappingClient:
+            async def post(_self, _url, **kwargs):
+                authorization = kwargs["headers"]["Authorization"]
+                if authorization == "Bearer secret":
+                    first_started.set()
+                    await release_first.wait()
+                else:
+                    second_started.set()
+                return quota_response(package())
+
+        manager = CredentialQuotaManager(
+            registry=self.registry,
+            usernames_provider=lambda: ("admin",),
+            http_client_factory=OverlappingClient,
+            now_factory=lambda: 1_000,
+            background_pacer=BackgroundRequestPacer(0, 0),
+        )
+        immediate = asyncio.create_task(
+            manager.probe_credential("admin", self.manager, self.credential_id),
+        )
+        scan = None
+        await first_started.wait()
+        try:
+            scan = asyncio.create_task(manager.scan_once())
+            await asyncio.wait_for(second_started.wait(), timeout=0.1)
+            self.assertFalse(immediate.done())
+        finally:
+            release_first.set()
+            tasks = [immediate]
+            if scan is not None:
+                tasks.append(scan)
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self.assertEqual(
+            manager.get_quota("admin", second_id)["status"],
+            "fresh",
+        )
+
+    async def test_probe_started_while_waiting_for_turn_is_joined_outside_pacer(self):
+        now = 0.0
+        pacing_wait_started = asyncio.Event()
+        release_pacing_wait = asyncio.Event()
+        request_started = asyncio.Event()
+        release_request = asyncio.Event()
+
+        async def blocking_sleep(delay):
+            self.assertEqual(delay, 10.0)
+            pacing_wait_started.set()
+            await release_pacing_wait.wait()
+
+        pacer = BackgroundRequestPacer(
+            10,
+            10,
+            uniform_factory=lambda _minimum, _maximum: 10.0,
+            monotonic_factory=lambda: now,
+            sleep=blocking_sleep,
+        )
+        async with pacer.turn() as mark_started:
+            mark_started()
+
+        class BlockingClient:
+            async def post(_self, _url, **_kwargs):
+                request_started.set()
+                await release_request.wait()
+                return quota_response(package())
+
+        manager = CredentialQuotaManager(
+            registry=self.registry,
+            usernames_provider=lambda: ("admin",),
+            http_client_factory=BlockingClient,
+            now_factory=lambda: 1_000,
+            background_pacer=pacer,
+        )
+        scan = asyncio.create_task(manager.scan_once())
+        immediate = None
+        follower = None
+        await pacing_wait_started.wait()
+        try:
+            immediate = asyncio.create_task(manager.probe_credential(
+                "admin",
+                self.manager,
+                self.credential_id,
+            ))
+            await request_started.wait()
+            now = 10.0
+            release_pacing_wait.set()
+            turn_acquired = asyncio.Event()
+
+            async def acquire_followup_turn():
+                async with pacer.turn():
+                    turn_acquired.set()
+
+            follower = asyncio.create_task(acquire_followup_turn())
+            await asyncio.wait_for(turn_acquired.wait(), timeout=0.1)
+            self.assertFalse(scan.done())
+            self.assertFalse(immediate.done())
+        finally:
+            release_pacing_wait.set()
+            release_request.set()
+            tasks = [scan]
+            if immediate is not None:
+                tasks.append(immediate)
+            if follower is not None:
+                tasks.append(follower)
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def test_locally_invalid_background_probe_does_not_consume_interval(self):
+        self.assertTrue(self.manager.add_credential_with_data({
+            "bearer_token": "valid-secret",
+            "user_id": "user-2",
+            "account_uid": "account-2",
+            "domain": "www.codebuddy.ai",
+        }, "valid.json"))
+        self.manager.get_credential_by_id(
+            self.credential_id,
+        )["department_full_name"] = "invalid\nheader"
+        clock = _FakeMonotonicClock()
+        starts = []
+
+        class TimedClient:
+            async def post(_self, _url, **_kwargs):
+                starts.append(clock.now)
+                return quota_response(package())
+
+        manager = CredentialQuotaManager(
+            registry=self.registry,
+            usernames_provider=lambda: ("admin",),
+            http_client_factory=TimedClient,
+            now_factory=lambda: 1_000,
+            background_pacer=BackgroundRequestPacer(
+                5,
+                5,
+                uniform_factory=lambda _minimum, _maximum: 5.0,
+                monotonic_factory=clock.monotonic,
+                sleep=clock.sleep,
+            ),
+        )
+
+        await manager.scan_once()
+
+        self.assertEqual(starts, [0.0])
+        self.assertEqual(clock.sleeps, [])
+
+    async def test_background_start_is_marked_after_client_preparation_before_post(self):
+        events = []
+
+        class OrderedClient:
+            async def post(_self, _url, **_kwargs):
+                events.append("post")
+                return quota_response(package())
+
+        async def client_factory():
+            events.append("client")
+            return OrderedClient()
+
+        manager = CredentialQuotaManager(http_client_factory=client_factory)
+        credential = self.manager.get_credential_by_id(self.credential_id)
+
+        await manager._fetch_quota(
+            credential,
+            _mark_started=lambda: events.append("mark"),
+        )
+
+        self.assertEqual(events, ["client", "mark", "post"])
+
+    async def test_cancelled_scan_keeps_turn_until_shielded_probe_starts(self):
+        client_factory_started = asyncio.Event()
+        release_client_factory = asyncio.Event()
+        request_started = asyncio.Event()
+
+        class OrderedClient:
+            async def post(_self, _url, **_kwargs):
+                request_started.set()
+                return quota_response(package())
+
+        async def client_factory():
+            client_factory_started.set()
+            await release_client_factory.wait()
+            return OrderedClient()
+
+        pacer = BackgroundRequestPacer(0, 0)
+        manager = CredentialQuotaManager(
+            registry=self.registry,
+            usernames_provider=lambda: ("admin",),
+            http_client_factory=client_factory,
+            now_factory=lambda: 1_000,
+            background_pacer=pacer,
+        )
+        scan = asyncio.create_task(manager.scan_once())
+        await client_factory_started.wait()
+        probe = next(iter(manager._inflight.values()))
+
+        scan.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await scan
+
+        next_turn_entered = asyncio.Event()
+
+        async def take_next_turn():
+            async with pacer.turn():
+                next_turn_entered.set()
+
+        next_turn = asyncio.create_task(take_next_turn())
+        await asyncio.sleep(0)
+        entered_before_probe_start = next_turn_entered.is_set()
+
+        release_client_factory.set()
+        result, _ = await asyncio.gather(probe, next_turn)
+
+        self.assertFalse(entered_before_probe_start)
+        self.assertTrue(request_started.is_set())
+        self.assertEqual(result["status"], "fresh")
+
+    async def test_scan_period_is_measured_from_cycle_start(self):
+        manager = CredentialQuotaManager(
+            usernames_provider=lambda: (),
+            interval_seconds=3_600,
+            monotonic_factory=mock.Mock(side_effect=[100.0, 700.0]),
+        )
+        manager._stop_event = asyncio.Event()
+        timeout_value = None
+
+        async def stop_during_wait(awaitable, *, timeout):
+            nonlocal timeout_value
+            timeout_value = timeout
+            awaitable.close()
+            manager._stop_event.set()
+            return True
+
+        with mock.patch("src.credential_quota.asyncio.wait_for", side_effect=stop_during_wait):
+            await manager._run()
+
+        self.assertEqual(timeout_value, 3_000.0)
+
+    async def test_scan_longer_than_interval_starts_next_cycle_immediately(self):
+        manager = CredentialQuotaManager(
+            usernames_provider=lambda: (),
+            interval_seconds=3_600,
+            monotonic_factory=mock.Mock(side_effect=[0.0, 3_601.0, 3_601.0]),
+        )
+        manager._stop_event = asyncio.Event()
+        scans = 0
+        pacing_modes = []
+
+        async def scan_once(*, apply_background_pacing):
+            nonlocal scans
+            scans += 1
+            pacing_modes.append(apply_background_pacing)
+            if scans == 2:
+                manager._stop_event.set()
+
+        manager.scan_once = scan_once
+        with mock.patch("src.credential_quota.asyncio.wait_for") as wait_for:
+            await manager._run()
+
+        self.assertEqual(scans, 2)
+        self.assertEqual(pacing_modes, [False, True])
+        wait_for.assert_not_called()
+
+    async def test_scan_timeout_starts_next_cycle_and_uses_asyncio_timeout_error(self):
+        manager = CredentialQuotaManager(
+            usernames_provider=lambda: (),
+            interval_seconds=3_600,
+            monotonic_factory=mock.Mock(side_effect=[100.0, 700.0, 700.0]),
+        )
+        manager._stop_event = asyncio.Event()
+        scans = 0
+        pacing_modes = []
+
+        async def scan_once(*, apply_background_pacing):
+            nonlocal scans
+            scans += 1
+            pacing_modes.append(apply_background_pacing)
+            if scans == 2:
+                manager._stop_event.set()
+
+        async def expire_wait(awaitable, *, timeout):
+            self.assertEqual(timeout, 3_000.0)
+            awaitable.close()
+            raise asyncio.TimeoutError
+
+        manager.scan_once = scan_once
+        with (
+            mock.patch("src.credential_quota.asyncio.wait_for", side_effect=expire_wait),
+            mock.patch(
+                "src.credential_quota.TimeoutError",
+                new=type("DifferentBuiltinTimeout", (Exception,), {}),
+                create=True,
+            ),
+        ):
+            await manager._run()
+
+        self.assertEqual(scans, 2)
+        self.assertEqual(pacing_modes, [False, True])
+
+    async def test_shutdown_cancels_scan_waiting_for_background_interval(self):
+        self.assertTrue(self.manager.add_credential_with_data({
+            "bearer_token": "second-secret",
+            "user_id": "user-2",
+            "account_uid": "account-2",
+            "domain": "www.codebuddy.ai",
+        }, "second.json"))
+        sleep_started = asyncio.Event()
+        release_sleep = asyncio.Event()
+
+        async def blocking_sleep(_delay):
+            sleep_started.set()
+            await release_sleep.wait()
+
+        pacer = BackgroundRequestPacer(
+            10,
+            10,
+            uniform_factory=lambda _minimum, _maximum: 10.0,
+            monotonic_factory=lambda: 0.0,
+            sleep=blocking_sleep,
+        )
+        manager, client = self.quota_manager(
+            [
+                quota_response(package()),
+                quota_response(package()),
+                quota_response(package()),
+            ],
+            background_pacer=pacer,
+            interval_seconds=0,
+        )
+        await manager.startup()
+        await sleep_started.wait()
+
+        await asyncio.wait_for(manager.shutdown(), timeout=0.1)
+
+        self.assertEqual(len(client.requests), 3)
+        self.assertIsNone(manager._task)
 
 
 if __name__ == "__main__":

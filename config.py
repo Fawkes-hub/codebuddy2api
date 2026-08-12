@@ -12,6 +12,7 @@ Users without saved settings inherit the startup defaults.
 """
 import ipaddress
 import logging
+import math
 import os
 import re
 import threading
@@ -74,6 +75,8 @@ _DEFAULT_CONFIG = {
     "CODEBUDDY_STRIP_MODEL_NAMESPACE": True,
     "CODEBUDDY_AUTO_ROTATION_ENABLED": True,
     "CODEBUDDY_AUTO_CHECKIN_ENABLED": False,
+    "CODEBUDDY_CREDENTIAL_BACKGROUND_DELAY_MIN_SECONDS": 5,
+    "CODEBUDDY_CREDENTIAL_BACKGROUND_DELAY_MAX_SECONDS": 20,
     "CODEBUDDY_ROTATION_COUNT": 1
 }
 
@@ -182,6 +185,19 @@ def _to_positive_int(value: Any, key: str) -> int:
     parsed = int(raw_value)
     if parsed <= 0:
         raise ValueError(f"{key} must be a positive integer")
+    return parsed
+
+
+def _to_nonnegative_float(value: Any, key: str) -> float:
+    """严格解析非负有限浮点数启动配置。"""
+    if isinstance(value, bool):
+        raise ValueError(f"{key} must be a non-negative finite number")
+    try:
+        parsed = float(str(value).strip())
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{key} must be a non-negative finite number") from error
+    if not math.isfinite(parsed) or parsed < 0:
+        raise ValueError(f"{key} must be a non-negative finite number")
     return parsed
 
 
@@ -434,6 +450,16 @@ def get_max_concurrent_requests() -> Optional[int]:
     return _to_positive_int(value, "CODEBUDDY_MAX_CONCURRENT_REQUESTS")
 
 
+def get_credential_background_delay_range() -> tuple[float, float]:
+    minimum_key = "CODEBUDDY_CREDENTIAL_BACKGROUND_DELAY_MIN_SECONDS"
+    maximum_key = "CODEBUDDY_CREDENTIAL_BACKGROUND_DELAY_MAX_SECONDS"
+    minimum = _to_nonnegative_float(_get_config_value(minimum_key), minimum_key)
+    maximum = _to_nonnegative_float(_get_config_value(maximum_key), maximum_key)
+    if minimum > maximum:
+        raise ValueError(f"{minimum_key} must not exceed {maximum_key}")
+    return minimum, maximum
+
+
 def get_ssl_verify() -> bool:
     return _to_bool(_get_config_value("CODEBUDDY_SSL_VERIFY"), "CODEBUDDY_SSL_VERIFY")
 
@@ -511,6 +537,7 @@ def _validate_startup_config() -> None:
     get_login_username_max_attempts()
     get_login_max_concurrency()
     get_max_concurrent_requests()
+    get_credential_background_delay_range()
     get_csp_frame_ancestors()
 
 # --- Public Setter for Hot-Reload ---
