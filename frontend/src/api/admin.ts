@@ -6,6 +6,8 @@ import type {
   ChatCompletionRequest,
   CodeBuddyPollAuthResponse,
   CredentialRecord,
+  CredentialQuota,
+  CredentialQuotaEnterpriseIdUpdateResponse,
   CredentialDailyCheckin,
   CredentialAccountsResponse,
   CredentialsResponse,
@@ -30,6 +32,7 @@ const CREDENTIAL_TEST_TIMEOUT_MS = 335_000;
 const ACCOUNT_SWITCH_TIMEOUT_MS = 70_000;
 // 手动签到可能依次等待自动签到、自身签到与随后并发执行的一轮额度探测。
 const DAILY_CHECKIN_TIMEOUT_MS = 335_000;
+const QUOTA_PROBE_TIMEOUT_MS = 35_000;
 const OAUTH_START_TIMEOUT_MS = 35_000;
 const OAUTH_POLL_TIMEOUT_MS = 100_000;
 const MODEL_LIST_TIMEOUT_MS = 35_000;
@@ -116,6 +119,20 @@ export const adminApi = {
     apiRequest<CredentialDailyCheckin>(
       `/api/admin/credentials/${encodeURIComponent(credentialId)}/daily-checkin`,
       { method: 'POST', timeoutMs: DAILY_CHECKIN_TIMEOUT_MS },
+    ),
+  refreshCredentialQuota: (credentialId: string) =>
+    apiRequest<{ quota: CredentialQuota }>(
+      `/api/admin/credentials/${encodeURIComponent(credentialId)}/quota/refresh`,
+      { method: 'POST', timeoutMs: QUOTA_PROBE_TIMEOUT_MS },
+    ),
+  updateCredentialQuotaEnterpriseId: (credentialId: string, enterpriseId: string | null) =>
+    apiRequest<CredentialQuotaEnterpriseIdUpdateResponse>(
+      `/api/admin/credentials/${encodeURIComponent(credentialId)}/quota-enterprise-id`,
+      {
+        method: 'PUT',
+        json: { enterprise_id: enterpriseId },
+        timeoutMs: QUOTA_PROBE_TIMEOUT_MS,
+      },
     ),
   statsOverview: (query: StatsOverviewQuery) =>
     apiRequest<StatsOverviewResponse>(`/api/admin/stats/overview?${buildStatsSearchParams(query)}`),

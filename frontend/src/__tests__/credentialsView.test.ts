@@ -145,6 +145,12 @@ function mountView() {
           emits: ['close', 'switching'],
           template: '<div class="credential-account-switcher-stub" />',
         },
+        CredentialQuotaEnterpriseDialog: {
+          name: 'CredentialQuotaEnterpriseDialog',
+          props: ['open', 'credential'],
+          emits: ['close', 'updating'],
+          template: '<div class="credential-quota-enterprise-dialog-stub" />',
+        },
         MousePointerClick: true,
         Copy: true,
         ExternalLink: true,
@@ -192,6 +198,7 @@ describe('CredentialsView', () => {
     expect(wrapper.vm.$.subTree.type).not.toBe(Fragment);
     expect(wrapper.element.tagName).toBe('DIV');
     expect(wrapper.findComponent({ name: 'CredentialAccountSwitcher' }).exists()).toBe(true);
+    expect(wrapper.findComponent({ name: 'CredentialQuotaEnterpriseDialog' }).exists()).toBe(true);
   });
 
   it('计算排序、当前状态和错误消息', () => {
@@ -503,6 +510,7 @@ describe('CredentialsView', () => {
     const testSpy = vi.spyOn(adminApi, 'testCredential').mockResolvedValue({} as never);
     const deleteSpy = vi.spyOn(adminApi, 'deleteCredential').mockResolvedValue({} as never);
     const checkinSpy = vi.spyOn(adminApi, 'dailyCheckin').mockResolvedValue({} as never);
+    const quotaSpy = vi.spyOn(adminApi, 'refreshCredentialQuota').mockResolvedValue({} as never);
     const wrapper = mountView();
     const state = (wrapper.vm.$ as any).setupState;
     state.credentialForm.bearerToken = 'token';
@@ -511,10 +519,12 @@ describe('CredentialsView', () => {
     await mutationOptions[3].mutationFn('cred');
     await mutationOptions[2].mutationFn('gone');
     await mutationOptions[5].mutationFn('cred');
+    await mutationOptions[6].mutationFn('cred');
     expect(createSpy).toHaveBeenCalledWith('token');
     expect(testSpy).toHaveBeenCalledWith('cred');
     expect(deleteSpy).toHaveBeenCalledWith('gone');
     expect(checkinSpy).toHaveBeenCalledWith('cred');
+    expect(quotaSpy).toHaveBeenCalledWith('cred');
   });
 
   it('测试 mutation 用 ID 集合维护并发行 loading 并提示结果', () => {
@@ -565,6 +575,26 @@ describe('CredentialsView', () => {
     expect([...state.checkingInIds]).toEqual(['cred-b']);
     await mutationOptions[5].onSettled(undefined, undefined, 'cred-b');
     expect([...state.checkingInIds]).toEqual([]);
+    expect(invalidateQueries).toHaveBeenCalledWith({
+      queryKey: ['admin', 'test-user', 'credentials'],
+    });
+  });
+
+  it('额度刷新 mutation 按凭证维护 loading、提示并在成功失败后刷新列表', async () => {
+    const wrapper = mountView();
+    const state = (wrapper.vm.$ as any).setupState;
+
+    mutationOptions[6].onMutate('cred-a');
+    mutationOptions[6].onMutate('cred-b');
+    expect([...state.refreshingQuotaIds]).toEqual(['cred-a', 'cred-b']);
+    state.refreshCredentialQuota('cred-a');
+    expect(mutationStates[6].mutate).not.toHaveBeenCalled();
+    mutationOptions[6].onSuccess();
+    expect(toastMock.success).toHaveBeenCalledWith('额度已刷新');
+    await mutationOptions[6].onSettled(undefined, undefined, 'cred-a');
+    expect([...state.refreshingQuotaIds]).toEqual(['cred-b']);
+    await mutationOptions[6].onSettled(undefined, undefined, 'cred-b');
+    expect([...state.refreshingQuotaIds]).toEqual([]);
     expect(invalidateQueries).toHaveBeenCalledWith({
       queryKey: ['admin', 'test-user', 'credentials'],
     });
@@ -637,14 +667,20 @@ describe('CredentialsView', () => {
     expect(actions.props?.canSwitchAccount).toBe(false);
     expect(actions.props?.canCheckIn).toBe(true);
     expect(actions.props?.isCheckingIn).toBe(false);
+    expect(actions.props?.isRefreshingQuota).toBe(false);
+    expect(actions.props?.canEditQuotaEnterpriseId).toBe(false);
     actions.props?.onSelect('valid');
     actions.props?.onTest('valid');
     actions.props?.onDelete('valid');
     actions.props?.onCheckin('valid');
+    actions.props?.onRefreshQuota('valid');
+    actions.props?.onEditQuotaEnterpriseId('valid');
     expect(mutationStates[1].mutate).toHaveBeenCalledWith('valid');
     expect(mutationStates[3].mutate).toHaveBeenCalledWith('valid');
     expect(mutationStates[2].mutate).toHaveBeenCalledWith('valid');
     expect(mutationStates[5].mutate).toHaveBeenCalledWith('valid');
+    expect(mutationStates[6].mutate).toHaveBeenCalledWith('valid');
+    expect(state.quotaEnterpriseCredentialId).toBe('');
 
     const activeActions = state.columns[6].render(active);
     expect(activeActions.type).toBe(CredentialActions);
@@ -652,7 +688,7 @@ describe('CredentialsView', () => {
     expect(activeActions.props?.autoRotationEnabled).toBe(false);
 
     credentialsQuery.data.value = {
-      credentials: [],
+      credentials: [{ ...valid, auth_source: 'manual' }],
       current: { credential_id: 'active', auto_rotation_enabled: true },
     };
     const enabledWrapper = mountView();
@@ -688,6 +724,8 @@ describe('CredentialsView', () => {
     state.testingIds.add('testing');
     state.openAccountSwitcher('blocked-by-test');
     expect(state.accountSwitcherCredentialId).toBe('');
+    state.openQuotaEnterpriseDialog('valid');
+    expect(state.quotaEnterpriseCredentialId).toBe('');
     state.testingIds.delete('testing');
     expect(
       enabledState.columns[6].render({
@@ -695,6 +733,29 @@ describe('CredentialsView', () => {
         has_refresh_token: true,
       }).props?.canSwitchAccount,
     ).toBe(false);
+
+    const manualActions = enabledState.columns[6].render({
+      ...valid,
+      auth_source: 'manual',
+      quota_enterprise_id: 'enterprise-1',
+    });
+    expect(manualActions.props?.canEditQuotaEnterpriseId).toBe(true);
+    manualActions.props?.onEditQuotaEnterpriseId('valid');
+    expect(enabledState.quotaEnterpriseCredentialId).toBe('valid');
+    await enabledWrapper.vm.$nextTick();
+    expect(
+      enabledWrapper.findComponent({ name: 'CredentialQuotaEnterpriseDialog' }).props('open'),
+    ).toBe(true);
+    const quotaDialog = enabledWrapper.findComponent({ name: 'CredentialQuotaEnterpriseDialog' });
+    quotaDialog.vm.$emit('updating', true);
+    await enabledWrapper.vm.$nextTick();
+    expect(enabledState.quotaEnterpriseUpdating).toBe(true);
+    enabledState.closeQuotaEnterpriseDialog();
+    expect(enabledState.quotaEnterpriseCredentialId).toBe('valid');
+    quotaDialog.vm.$emit('updating', false);
+    await enabledWrapper.vm.$nextTick();
+    enabledState.closeQuotaEnterpriseDialog();
+    expect(enabledState.quotaEnterpriseCredentialId).toBe('');
 
     mutationOptions[3].onMutate('valid');
     expect(enabledState.columns[6].render(valid).props?.isTesting).toBe(true);
@@ -751,11 +812,34 @@ describe('CredentialsView', () => {
     mutationOptions[2].onSettled(undefined, undefined, 'second');
   });
 
+  it('过期的手动凭证显示禁用的企业 ID 编辑入口并拒绝打开弹窗', () => {
+    const expiredManual = {
+      credential_id: 'expired-manual',
+      is_expired: true,
+      auth_source: 'manual',
+    };
+    credentialsQuery.data.value = {
+      credentials: [expiredManual],
+      current: {},
+    };
+    const wrapper = mountView();
+    const state = (wrapper.vm.$ as any).setupState;
+    const actions = state.columns[6].render(expiredManual);
+
+    expect(actions.props?.canEditQuotaEnterpriseId).toBe(true);
+    expect(actions.props?.quotaEnterpriseIdDisabledReason).toBe('凭证已过期，无法修改企业 ID');
+    actions.props?.onEditQuotaEnterpriseId('expired-manual');
+    expect(state.quotaEnterpriseCredentialId).toBe('');
+  });
+
   it('保持单一页面根节点，使路由过渡能完整进入和离开', () => {
     const wrapper = mountView();
 
     expect((wrapper.vm.$ as any).subTree.type).toBe('div');
     expect(wrapper.find('.section-grid > .credential-account-switcher-stub').exists()).toBe(true);
+    expect(wrapper.find('.section-grid > .credential-quota-enterprise-dialog-stub').exists()).toBe(
+      true,
+    );
   });
 
   it('存在测试时禁止新增、轮换与开始认证', async () => {

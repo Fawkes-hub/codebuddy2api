@@ -1,16 +1,19 @@
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, ref, type Component } from 'vue';
 import {
   Building2,
   CalendarCheck,
   CircleCheckBig,
   MousePointerClick,
+  Pencil,
+  RefreshCw,
   RotateCcw,
   Trash2,
 } from '@lucide/vue';
 import type { CredentialRecord } from '../types';
+import CActionMenu from './ui/CActionMenu.vue';
 import CButton from './ui/CButton.vue';
-import CPopconfirm from './ui/CPopconfirm.vue';
+import CModal from './ui/CModal.vue';
 import CTooltip from './ui/CTooltip.vue';
 
 interface Props {
@@ -26,6 +29,19 @@ interface Props {
   canCheckIn?: boolean;
   isCheckingIn?: boolean;
   checkinDisabledReason?: string;
+  isRefreshingQuota?: boolean;
+  canEditQuotaEnterpriseId?: boolean;
+  quotaEnterpriseIdDisabledReason?: string;
+}
+
+interface MenuItem {
+  key: string;
+  label: string;
+  icon: Component;
+  disabled?: boolean;
+  title?: string;
+  danger?: boolean;
+  separatorBefore?: boolean;
 }
 
 const props = withDefaults(defineProps<Props>(), {
@@ -38,6 +54,9 @@ const props = withDefaults(defineProps<Props>(), {
   canCheckIn: false,
   isCheckingIn: false,
   checkinDisabledReason: '',
+  isRefreshingQuota: false,
+  canEditQuotaEnterpriseId: false,
+  quotaEnterpriseIdDisabledReason: '',
 });
 
 const emit = defineEmits<{
@@ -46,31 +65,32 @@ const emit = defineEmits<{
   delete: [credentialId: string];
   switchAccount: [credentialId: string];
   checkin: [credentialId: string];
+  refreshQuota: [credentialId: string];
+  editQuotaEnterpriseId: [credentialId: string];
 }>();
 
+const deleteModalOpen = ref(false);
 const deleteTitle = computed(
   () =>
     `确定删除凭证 ${props.credential.email || props.credential.user_id || props.credential.credential_id}？该操作不可恢复`,
 );
 const isFixedCurrent = computed(() => props.isCurrent && !props.autoRotationEnabled);
-const selectDisabled = computed(
-  () => isFixedCurrent.value || props.writeInProgress || props.hasActiveTests || props.isCheckingIn,
+const rowBusy = computed(() => props.isCheckingIn || props.isRefreshingQuota || props.isDeleting);
+const actionsBlocked = computed(
+  () => props.writeInProgress || props.hasActiveTests || rowBusy.value,
 );
-const testDisabled = computed(() => props.writeInProgress || props.isTesting || props.isCheckingIn);
-const deleteDisabled = computed(
-  () => props.writeInProgress || props.hasActiveTests || props.isCheckingIn,
-);
+const selectDisabled = computed(() => isFixedCurrent.value || actionsBlocked.value);
+const testDisabled = computed(() => props.isTesting || props.writeInProgress || rowBusy.value);
 const checkinDisabled = computed(
   () =>
-    props.writeInProgress ||
-    props.isCheckingIn ||
+    actionsBlocked.value ||
     Boolean(props.checkinDisabledReason) ||
     props.credential.daily_checkin?.success === true,
 );
-const checkinTooltipLines = computed(() => {
-  if (props.checkinDisabledReason) return [props.checkinDisabledReason];
+const checkinTitle = computed(() => {
+  if (props.checkinDisabledReason) return props.checkinDisabledReason;
   const detail = props.credential.daily_checkin;
-  if (!detail) return ['签到'];
+  if (!detail) return '签到';
   const lines: string[] = [];
   if (detail.code === 0) {
     const checkedInAt =
@@ -86,7 +106,7 @@ const checkinTooltipLines = computed(() => {
   if (detail.success && typeof detail.next_checkin_at === 'number') {
     lines.push(`下次可签到：${new Date(detail.next_checkin_at * 1000).toLocaleString()}`);
   }
-  return lines;
+  return lines.join('\n');
 });
 const selectTooltip = computed(() => {
   if (!props.isCurrent) return '设为当前凭证';
@@ -96,36 +116,87 @@ const selectAriaLabel = computed(() => {
   if (!props.isCurrent) return '切换为当前凭证';
   return props.autoRotationEnabled ? '固定当前凭证' : '已是当前凭证';
 });
+const menuItems = computed<MenuItem[]>(() => {
+  const items: MenuItem[] = [];
+  if (props.canCheckIn || props.checkinDisabledReason) {
+    items.push({
+      key: 'checkin',
+      label: '签到',
+      icon: CalendarCheck,
+      disabled: checkinDisabled.value,
+      title: checkinTitle.value,
+    });
+  }
+  if (props.canSwitchAccount) {
+    items.push({
+      key: 'switchAccount',
+      label: '切换 CodeBuddy 账号',
+      icon: Building2,
+      disabled: actionsBlocked.value,
+    });
+  }
+  items.push({
+    key: 'refreshQuota',
+    label: '刷新额度',
+    icon: RefreshCw,
+    disabled: actionsBlocked.value || props.credential.is_expired,
+    title: props.credential.is_expired ? '凭证已过期，无法刷新额度' : undefined,
+  });
+  if (props.canEditQuotaEnterpriseId) {
+    items.push({
+      key: 'editQuotaEnterpriseId',
+      label: props.credential.quota_enterprise_id ? '修改企业ID' : '标记为企业版',
+      icon: Pencil,
+      disabled: actionsBlocked.value || Boolean(props.quotaEnterpriseIdDisabledReason),
+      title: props.quotaEnterpriseIdDisabledReason || undefined,
+    });
+  }
+  items.push({
+    key: 'delete',
+    label: '删除凭证',
+    icon: Trash2,
+    disabled: actionsBlocked.value,
+    danger: true,
+    separatorBefore: true,
+  });
+  return items;
+});
 
 function selectCredential(): void {
-  if (selectDisabled.value) return;
-  emit('select', props.credential.credential_id);
+  if (!selectDisabled.value) emit('select', props.credential.credential_id);
 }
 
 function testCredential(): void {
-  if (testDisabled.value) return;
-  emit('test', props.credential.credential_id);
+  if (!testDisabled.value) emit('test', props.credential.credential_id);
 }
 
-function deleteCredential(): void {
-  if (deleteDisabled.value) return;
+function handleMenuAction(key: string): void {
+  if (actionsBlocked.value) return;
+  if (key === 'checkin' && props.canCheckIn && !checkinDisabled.value) {
+    emit('checkin', props.credential.credential_id);
+  } else if (key === 'switchAccount' && props.canSwitchAccount) {
+    emit('switchAccount', props.credential.credential_id);
+  } else if (key === 'refreshQuota' && !props.credential.is_expired) {
+    emit('refreshQuota', props.credential.credential_id);
+  } else if (
+    key === 'editQuotaEnterpriseId' &&
+    props.canEditQuotaEnterpriseId &&
+    !props.quotaEnterpriseIdDisabledReason
+  ) {
+    emit('editQuotaEnterpriseId', props.credential.credential_id);
+  } else if (key === 'delete') {
+    deleteModalOpen.value = true;
+  }
+}
+
+function closeDeleteModal(): void {
+  if (!props.isDeleting) deleteModalOpen.value = false;
+}
+
+function confirmDelete(): void {
+  if (actionsBlocked.value) return;
+  deleteModalOpen.value = false;
   emit('delete', props.credential.credential_id);
-}
-
-function switchAccount(): void {
-  if (
-    props.writeInProgress ||
-    props.hasActiveTests ||
-    props.isCheckingIn ||
-    !props.canSwitchAccount
-  )
-    return;
-  emit('switchAccount', props.credential.credential_id);
-}
-
-function checkin(): void {
-  if (!props.canCheckIn || checkinDisabled.value) return;
-  emit('checkin', props.credential.credential_id);
 }
 </script>
 
@@ -164,54 +235,24 @@ function checkin(): void {
       </CButton>
     </CTooltip>
 
-    <CTooltip v-if="canSwitchAccount" content="切换 CodeBuddy 账号">
-      <CButton
-        size="sm"
-        variant="secondary"
-        shape="circle"
-        class="table-action-button"
-        :disabled="writeInProgress || hasActiveTests || isCheckingIn"
-        aria-label="切换 CodeBuddy 账号"
-        @click="switchAccount"
-      >
-        <template #icon><Building2 :size="14" /></template>
-      </CButton>
-    </CTooltip>
-
-    <CTooltip v-if="canCheckIn || checkinDisabledReason">
-      <template #content>
-        <span class="flex flex-col gap-1">
-          <span v-for="line in checkinTooltipLines" :key="line">{{ line }}</span>
-        </span>
-      </template>
-      <CButton
-        size="sm"
-        variant="secondary"
-        shape="circle"
-        class="table-action-button"
-        :loading="isCheckingIn"
-        :disabled="checkinDisabled"
-        aria-label="签到"
-        @click="checkin"
-      >
-        <template #icon><CalendarCheck :size="14" /></template>
-      </CButton>
-    </CTooltip>
-
-    <CTooltip content="删除凭证">
-      <CPopconfirm :title="deleteTitle" confirm-variant="danger" @confirm="deleteCredential">
-        <CButton
-          size="sm"
-          variant="secondary"
-          shape="circle"
-          class="table-action-button"
-          :loading="isDeleting"
-          :disabled="deleteDisabled"
-          aria-label="删除凭证"
-        >
-          <template #icon><Trash2 :size="14" /></template>
-        </CButton>
-      </CPopconfirm>
-    </CTooltip>
+    <CActionMenu
+      :items="menuItems"
+      :disabled="actionsBlocked"
+      :loading="isCheckingIn || isRefreshingQuota || isDeleting"
+      @select="handleMenuAction"
+    />
   </div>
+
+  <CModal
+    :open="deleteModalOpen"
+    title="删除凭证"
+    :closable="!isDeleting"
+    @update:open="closeDeleteModal"
+  >
+    <p class="text-sm text-text">{{ deleteTitle }}</p>
+    <template #footer>
+      <CButton :disabled="isDeleting" @click="closeDeleteModal">取消</CButton>
+      <CButton variant="danger" :loading="isDeleting" @click="confirmDelete">删除</CButton>
+    </template>
+  </CModal>
 </template>

@@ -19,6 +19,7 @@ import { useClipboard } from '../composables/useClipboard';
 import { useToast } from '../composables/useToast';
 import CredentialActions from '../components/CredentialActions.vue';
 import CredentialAccountSwitcher from '../components/CredentialAccountSwitcher.vue';
+import CredentialQuotaEnterpriseDialog from '../components/CredentialQuotaEnterpriseDialog.vue';
 import CredentialQuotaRing from '../components/CredentialQuotaRing.vue';
 import RefreshButton from '../components/RefreshButton.vue';
 import { filterCredentials, type CredentialFilterTab } from '../utils/credentialsFilter';
@@ -44,10 +45,13 @@ const credentialRules: FormRules = {
 
 const testingIds = reactive(new Set<string>());
 const checkingInIds = reactive(new Set<string>());
+const refreshingQuotaIds = reactive(new Set<string>());
 const selectingId = ref<string | null>(null);
 const deletingId = ref<string | null>(null);
 const accountSwitcherCredentialId = ref('');
 const accountSwitching = ref(false);
+const quotaEnterpriseCredentialId = ref('');
+const quotaEnterpriseUpdating = ref(false);
 
 const filterTab = ref<CredentialFilterTab>('all');
 const credentialFilterOrder: Record<CredentialFilterTab, number> = {
@@ -64,6 +68,12 @@ const credentialsQuery = useQuery({
 
 const allCredentials = computed<CredentialRecord[]>(
   () => credentialsQuery.data.value?.credentials || [],
+);
+const quotaEnterpriseCredential = computed(
+  () =>
+    allCredentials.value.find(
+      (credential) => credential.credential_id === quotaEnterpriseCredentialId.value,
+    ) || null,
 );
 
 /**
@@ -251,6 +261,20 @@ const checkinMutation = useMutation({
   },
 });
 
+const refreshQuotaMutation = useMutation({
+  mutationFn: (credentialId: string) => adminApi.refreshCredentialQuota(credentialId),
+  onMutate: (credentialId: string) => {
+    refreshingQuotaIds.add(credentialId);
+  },
+  onSuccess: () => {
+    toast.success('额度已刷新');
+  },
+  onSettled: async (_data, _error, credentialId) => {
+    refreshingQuotaIds.delete(credentialId);
+    await queryClient.invalidateQueries({ queryKey: queryKeys.credentials });
+  },
+});
+
 const hasActiveTests = computed(() => testingIds.size > 0);
 const writeInProgress = computed(
   () =>
@@ -258,7 +282,10 @@ const writeInProgress = computed(
     deletingId.value !== null ||
     createMutation.isPending.value ||
     toggleRotationMutation.isPending.value ||
-    accountSwitching.value,
+    accountSwitching.value ||
+    quotaEnterpriseUpdating.value ||
+    Boolean(accountSwitcherCredentialId.value) ||
+    Boolean(quotaEnterpriseCredentialId.value),
 );
 
 async function invalidateCredentials() {
@@ -313,8 +340,41 @@ function openAccountSwitcher(credentialId: string): void {
 }
 
 function checkinCredential(credentialId: string): void {
-  if (checkingInIds.has(credentialId)) return;
+  if (
+    writeInProgress.value ||
+    checkingInIds.has(credentialId) ||
+    refreshingQuotaIds.has(credentialId)
+  )
+    return;
   checkinMutation.mutate(credentialId);
+}
+
+function refreshCredentialQuota(credentialId: string): void {
+  if (
+    writeInProgress.value ||
+    hasActiveTests.value ||
+    checkingInIds.has(credentialId) ||
+    refreshingQuotaIds.has(credentialId)
+  )
+    return;
+  refreshQuotaMutation.mutate(credentialId);
+}
+
+function openQuotaEnterpriseDialog(credentialId: string): void {
+  if (writeInProgress.value || hasActiveTests.value) return;
+  const credential = allCredentials.value.find((item) => item.credential_id === credentialId);
+  if (
+    !credential ||
+    credential.is_expired ||
+    credential.auth_source !== 'manual' ||
+    credential.enterprise_id
+  )
+    return;
+  quotaEnterpriseCredentialId.value = credentialId;
+}
+
+function closeQuotaEnterpriseDialog(): void {
+  if (!quotaEnterpriseUpdating.value) quotaEnterpriseCredentialId.value = '';
 }
 
 function closeAccountSwitcher(): void {
@@ -362,7 +422,7 @@ const columns: Column<CredentialRecord>[] = [
   {
     title: '操作',
     key: 'actions',
-    width: 260,
+    width: 168,
     align: 'left',
     headerClassName: 'table-action-header',
     render: (row) =>
@@ -378,12 +438,21 @@ const columns: Column<CredentialRecord>[] = [
         canSwitchAccount: Boolean(row.has_refresh_token && (row.account_count || 0) > 1),
         canCheckIn: !row.is_expired && !row.enterprise_id,
         isCheckingIn: checkingInIds.has(row.credential_id),
-        checkinDisabledReason: row.enterprise_id ? '企业版凭证不支持签到' : undefined,
+        checkinDisabledReason: row.enterprise_id
+          ? '企业版凭证不支持签到'
+          : row.is_expired
+            ? '凭证已过期，无法签到'
+            : undefined,
+        isRefreshingQuota: refreshingQuotaIds.has(row.credential_id),
+        canEditQuotaEnterpriseId: row.auth_source === 'manual' && !row.enterprise_id,
+        quotaEnterpriseIdDisabledReason: row.is_expired ? '凭证已过期，无法修改企业 ID' : undefined,
         onSelect: selectCredential,
         onTest: testCredential,
         onDelete: deleteCredential,
         onSwitchAccount: openAccountSwitcher,
         onCheckin: checkinCredential,
+        onRefreshQuota: refreshCredentialQuota,
+        onEditQuotaEnterpriseId: openQuotaEnterpriseDialog,
       }),
   },
 ];
@@ -535,6 +604,12 @@ const tableRows = computed(() => rows.value as unknown as Record<string, unknown
       :disabled="checkingInIds.has(accountSwitcherCredentialId)"
       @close="closeAccountSwitcher"
       @switching="accountSwitching = $event"
+    />
+    <CredentialQuotaEnterpriseDialog
+      :open="Boolean(quotaEnterpriseCredentialId)"
+      :credential="quotaEnterpriseCredential"
+      @close="closeQuotaEnterpriseDialog"
+      @updating="quotaEnterpriseUpdating = $event"
     />
   </div>
 </template>

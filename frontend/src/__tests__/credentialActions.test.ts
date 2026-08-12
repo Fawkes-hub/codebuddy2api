@@ -2,22 +2,22 @@ import { defineComponent } from 'vue';
 import { mount } from '@vue/test-utils';
 import { describe, expect, it } from 'vitest';
 import CredentialActions from '../components/CredentialActions.vue';
-import CPopconfirm from '../components/ui/CPopconfirm.vue';
-import CTooltip from '../components/ui/CTooltip.vue';
+import CActionMenu from '../components/ui/CActionMenu.vue';
 import type { CredentialRecord } from '../types';
 
-const TooltipStub = defineComponent({
-  name: 'CTooltip',
-  props: { content: String },
-  template: '<span class="tooltip-stub"><slot /><slot name="content" /></span>',
+const ActionMenuStub = defineComponent({
+  name: 'CActionMenu',
+  props: ['items', 'disabled', 'loading'],
+  emits: ['select'],
+  template: '<div class="action-menu-stub" />',
 });
 
-const PopconfirmStub = defineComponent({
-  name: 'CPopconfirm',
-  props: { title: String, confirmVariant: String },
-  emits: ['confirm'],
+const ModalStub = defineComponent({
+  name: 'CModal',
+  props: ['open', 'title', 'closable'],
+  emits: ['update:open'],
   template:
-    '<span class="popconfirm-stub"><slot /><button aria-label="确认删除" @click="$emit(\'confirm\')" /></span>',
+    '<div v-if="open" class="modal-stub"><slot /><div class="modal-footer"><slot name="footer" /></div></div>',
 });
 
 const credential: CredentialRecord = {
@@ -28,187 +28,82 @@ const credential: CredentialRecord = {
   time_remaining_str: '1h',
   is_expired: false,
   token_type: 'Bearer',
+  auth_source: 'manual',
   has_refresh_token: false,
   has_token: true,
   token_display: 'token...view',
 };
 
-function mountActions(
-  overrides: Partial<{
-    credential: CredentialRecord;
-    isCurrent: boolean;
-    autoRotationEnabled: boolean;
-    isTesting: boolean;
-    isSelecting: boolean;
-    isDeleting: boolean;
-    writeInProgress: boolean;
-    hasActiveTests: boolean;
-    canSwitchAccount: boolean;
-    canCheckIn: boolean;
-    isCheckingIn: boolean;
-    checkinDisabledReason: string;
-  }> = {},
-) {
+function mountActions(overrides: Record<string, unknown> = {}) {
   return mount(CredentialActions, {
     props: {
       credential,
       isCurrent: false,
       isTesting: false,
+      canCheckIn: true,
+      canEditQuotaEnterpriseId: true,
       ...overrides,
     },
-    global: {
-      stubs: {
-        CTooltip: TooltipStub,
-        CPopconfirm: PopconfirmStub,
-      },
-    },
+    global: { stubs: { CActionMenu: ActionMenuStub, CModal: ModalStub } },
   });
 }
 
-describe('CredentialActions', () => {
-  it('非当前凭证可执行切换、测试和删除', async () => {
-    const wrapper = mountActions();
+function items(wrapper: ReturnType<typeof mountActions>) {
+  return wrapper.findComponent(CActionMenu).props('items') as Array<Record<string, any>>;
+}
 
-    expect(wrapper.findAllComponents(CTooltip).map((item) => item.props('content'))).toEqual([
-      '设为当前凭证',
-      '测试凭证',
+describe('CredentialActions', () => {
+  it('仅保留选择和测试快捷按钮，其余操作按顺序进入图标加名称菜单', async () => {
+    const wrapper = mountActions();
+    expect(wrapper.findAll('.table-action-button')).toHaveLength(2);
+    expect(items(wrapper).map((item) => item.label)).toEqual([
+      '签到',
+      '刷新额度',
+      '标记为企业版',
       '删除凭证',
     ]);
+    expect(items(wrapper).every((item) => item.icon)).toBe(true);
+    expect(items(wrapper).at(-1)?.separatorBefore).toBe(true);
+    expect(items(wrapper).at(-1)?.danger).toBe(true);
 
     await wrapper.get('[aria-label="切换为当前凭证"]').trigger('click');
     await wrapper.get('[aria-label="测试凭证"]').trigger('click');
-    await wrapper.get('[aria-label="确认删除"]').trigger('click');
-
     expect(wrapper.emitted('select')).toEqual([['cred-1']]);
     expect(wrapper.emitted('test')).toEqual([['cred-1']]);
-    expect(wrapper.emitted('delete')).toEqual([['cred-1']]);
 
-    await wrapper.setProps({ isTesting: true });
-    expect(wrapper.get('[aria-label="测试凭证"]').attributes('disabled')).toBeDefined();
+    const menu = wrapper.findComponent(CActionMenu);
+    menu.vm.$emit('select', 'checkin');
+    menu.vm.$emit('select', 'refreshQuota');
+    menu.vm.$emit('select', 'editQuotaEnterpriseId');
+    (wrapper.vm.$ as any).setupState.handleMenuAction('unknown');
+    expect(wrapper.emitted('checkin')).toEqual([['cred-1']]);
+    expect(wrapper.emitted('refreshQuota')).toEqual([['cred-1']]);
+    expect(wrapper.emitted('editQuotaEnterpriseId')).toEqual([['cred-1']]);
   });
 
-  it('当前凭证显示禁用状态且不提供切换操作', async () => {
-    const wrapper = mountActions({ isCurrent: true });
-    const currentButton = wrapper.get('[aria-label="已是当前凭证"]');
-
-    expect(currentButton.attributes('disabled')).toBeDefined();
-    expect(currentButton.classes()).toContain('current-credential-action-button');
-    expect(wrapper.find('[aria-label="切换为当前凭证"]').exists()).toBe(false);
-    await currentButton.trigger('click');
-    expect(wrapper.emitted('select')).toBeUndefined();
-  });
-
-  it('自动轮换开启时当前凭证仍可点击固定', async () => {
-    const wrapper = mountActions({ isCurrent: true, autoRotationEnabled: true });
-    const currentButton = wrapper.get('[aria-label="固定当前凭证"]');
-
-    expect(currentButton.attributes('disabled')).toBeUndefined();
-    expect(currentButton.classes()).not.toContain('current-credential-action-button');
-    await currentButton.trigger('click');
-    expect(wrapper.emitted('select')).toEqual([['cred-1']]);
-  });
-
-  it('删除确认文案依次使用邮箱、用户 ID 和凭证 ID', async () => {
-    const wrapper = mountActions();
-    const popconfirm = wrapper.findComponent(CPopconfirm);
-    expect(popconfirm.props('title')).toContain('user@example.com');
-    expect(popconfirm.props('confirmVariant')).toBe('danger');
-
-    await wrapper.setProps({ credential: { ...credential, email: undefined } });
-    expect(popconfirm.props('title')).toContain('user-1');
-
-    await wrapper.setProps({ credential: { ...credential, email: undefined, user_id: '' } });
-    expect(popconfirm.props('title')).toContain('cred-1');
-  });
-
-  it('并发测试只锁定写操作，任一写操作会锁定全部行操作', async () => {
-    const wrapper = mountActions({ hasActiveTests: true });
-    const selectButton = wrapper.get('[aria-label="切换为当前凭证"]');
-
-    expect(selectButton.attributes('disabled')).toBeDefined();
-    expect(selectButton.classes()).not.toContain('current-credential-action-button');
-    expect(selectButton.find('.lucide-circle-check-big').exists()).toBe(false);
-    expect(selectButton.find('.lucide-mouse-pointer-click').exists()).toBe(true);
-    expect(wrapper.get('[aria-label="删除凭证"]').attributes('disabled')).toBeDefined();
-    expect(wrapper.get('[aria-label="测试凭证"]').attributes('disabled')).toBeUndefined();
-
-    await wrapper.setProps({ isTesting: true });
-    expect(wrapper.get('[aria-label="测试凭证"]').attributes('disabled')).toBeDefined();
-
-    await wrapper.setProps({ hasActiveTests: false, isTesting: false, writeInProgress: true });
-    expect(wrapper.get('[aria-label="切换为当前凭证"]').attributes('disabled')).toBeDefined();
-    expect(wrapper.get('[aria-label="测试凭证"]').attributes('disabled')).toBeDefined();
-    expect(wrapper.get('[aria-label="删除凭证"]').attributes('disabled')).toBeDefined();
-
-    await wrapper.get('[aria-label="切换为当前凭证"]').trigger('click');
-    await wrapper.get('[aria-label="测试凭证"]').trigger('click');
-    await wrapper.get('[aria-label="确认删除"]').trigger('click');
-    const state = (wrapper.vm.$ as any).setupState;
-    state.selectCredential();
-    state.testCredential();
-    expect(wrapper.emitted('select')).toBeUndefined();
-    expect(wrapper.emitted('test')).toBeUndefined();
-    expect(wrapper.emitted('delete')).toBeUndefined();
-  });
-
-  it('选择和删除分别显示目标行 loading', async () => {
-    const wrapper = mountActions({ isSelecting: true });
-    expect(wrapper.get('[aria-label="切换为当前凭证"]').attributes('disabled')).toBeDefined();
-
-    await wrapper.setProps({ isSelecting: false, isDeleting: true });
-    expect(wrapper.get('[aria-label="删除凭证"]').attributes('disabled')).toBeDefined();
-  });
-
-  it('仅对可切换的 OAuth 凭证显示账号切换操作', async () => {
-    const wrapper = mountActions({ canSwitchAccount: true });
-
-    expect(wrapper.findAllComponents(CTooltip).map((item) => item.props('content'))).toEqual([
-      '设为当前凭证',
-      '测试凭证',
+  it('按凭证能力显示账号切换与企业标记文案', async () => {
+    const wrapper = mountActions({
+      canSwitchAccount: true,
+      credential: { ...credential, quota_enterprise_id: 'enterprise-1' },
+    });
+    expect(items(wrapper).map((item) => item.label)).toEqual([
+      '签到',
       '切换 CodeBuddy 账号',
+      '刷新额度',
+      '修改企业ID',
       '删除凭证',
     ]);
-    await wrapper.get('[aria-label="切换 CodeBuddy 账号"]').trigger('click');
+    wrapper.findComponent(CActionMenu).vm.$emit('select', 'switchAccount');
     expect(wrapper.emitted('switchAccount')).toEqual([['cred-1']]);
 
-    await wrapper.setProps({ writeInProgress: true });
-    await wrapper.get('[aria-label="切换 CodeBuddy 账号"]').trigger('click');
-    const state = (wrapper.vm.$ as any).setupState;
-    state.switchAccount();
-    expect(wrapper.emitted('switchAccount')).toEqual([['cred-1']]);
-
-    await wrapper.setProps({ writeInProgress: false, hasActiveTests: true });
-    state.switchAccount();
-    expect(wrapper.emitted('switchAccount')).toEqual([['cred-1']]);
-
-    await wrapper.setProps({ hasActiveTests: false, canSwitchAccount: false });
-    state.switchAccount();
-    expect(wrapper.emitted('switchAccount')).toEqual([['cred-1']]);
+    await wrapper.setProps({ canSwitchAccount: false, canEditQuotaEnterpriseId: false });
+    expect(items(wrapper).map((item) => item.label)).toEqual(['签到', '刷新额度', '删除凭证']);
+    await wrapper.setProps({ canCheckIn: false });
+    expect(items(wrapper).map((item) => item.label)).toEqual(['刷新额度', '删除凭证']);
   });
 
-  it('仅对有效个人版凭证显示签到，并展示今日详情和成功禁用状态', async () => {
-    const wrapper = mountActions({ canCheckIn: true });
-    const state = (wrapper.vm.$ as any).setupState;
-    expect(state.checkinTooltipLines).toEqual(['签到']);
-    const button = wrapper.get('[aria-label="签到"]');
-    expect(button.attributes('disabled')).toBeUndefined();
-    await button.trigger('click');
-    expect(wrapper.emitted('checkin')).toEqual([['cred-1']]);
-
-    await wrapper.setProps({
-      credential: {
-        ...credential,
-        daily_checkin: {
-          code: 7,
-          message: '稍后再试',
-          success: false,
-        },
-      },
-    });
-    expect(state.checkinTooltipLines).toEqual(['Code：7', '消息：稍后再试']);
-    expect(wrapper.get('[aria-label="签到"]').attributes('disabled')).toBeUndefined();
-
-    await wrapper.setProps({
+  it('保留签到详情、资格原因和已过期额度刷新原因', async () => {
+    const wrapper = mountActions({
       credential: {
         ...credential,
         daily_checkin: {
@@ -221,76 +116,133 @@ describe('CredentialActions', () => {
         },
       },
     });
-    expect(state.checkinTooltipLines[0]).toContain('签到时间：');
-    expect(state.checkinTooltipLines).toContain('获得积分：100');
-    expect(state.checkinTooltipLines.at(-1)).toContain('下次可签到：');
-    expect(wrapper.get('[aria-label="签到"]').attributes('disabled')).toBeDefined();
-    state.checkin();
-    expect(wrapper.emitted('checkin')).toEqual([['cred-1']]);
-
-    await wrapper.setProps({ isCheckingIn: true });
-    expect(wrapper.get('[aria-label="签到"]').attributes('disabled')).toBeDefined();
+    const checkin = items(wrapper)[0];
+    expect(checkin.disabled).toBe(true);
+    expect(checkin.title).toContain('签到时间：');
+    expect(checkin.title).toContain('获得积分：100');
+    expect(checkin.title).toContain('下次可签到：');
 
     await wrapper.setProps({
-      isCheckingIn: false,
       credential: {
         ...credential,
-        daily_checkin: {
-          code: 0,
-          message: 'OK',
-          success: true,
-          credit: null,
-        },
+        daily_checkin: { code: 0, message: 'OK', success: true, credit: null },
       },
     });
-    expect(state.checkinTooltipLines).toEqual(['签到时间：-', '获得积分：-']);
+    expect(items(wrapper)[0].title).toBe('签到时间：-\n获得积分：-');
+
+    await wrapper.setProps({
+      credential: {
+        ...credential,
+        daily_checkin: { code: 7, message: '稍后再试', success: false },
+      },
+    });
+    expect(items(wrapper)[0].title).toBe('Code：7\n消息：稍后再试');
 
     await wrapper.setProps({
       credential: {
         ...credential,
         daily_checkin: { code: null, message: '网络异常', success: false },
       },
-      writeInProgress: true,
     });
-    expect(state.checkinTooltipLines).toEqual(['Code：未知', '消息：网络异常']);
-    state.checkin();
-    expect(wrapper.emitted('checkin')).toEqual([['cred-1']]);
+    expect(items(wrapper)[0].title).toBe('Code：未知\n消息：网络异常');
 
-    const hidden = mountActions();
-    (hidden.vm.$ as any).setupState.checkin();
-    expect(hidden.emitted('checkin')).toBeUndefined();
+    await wrapper.setProps({
+      credential: { ...credential, is_expired: true },
+      canCheckIn: false,
+      checkinDisabledReason: '凭证已过期，无法签到',
+    });
+    expect(items(wrapper)[0]).toMatchObject({
+      label: '签到',
+      disabled: true,
+      title: '凭证已过期，无法签到',
+    });
+    expect(items(wrapper)[1]).toMatchObject({
+      label: '刷新额度',
+      disabled: true,
+      title: '凭证已过期，无法刷新额度',
+    });
   });
 
-  it('签到期间禁用同一凭证的冲突操作', async () => {
+  it('并发状态锁定快捷按钮和菜单并阻止重复事件', async () => {
     const wrapper = mountActions({
-      canCheckIn: true,
+      isCurrent: true,
+      autoRotationEnabled: true,
+      isRefreshingQuota: true,
       canSwitchAccount: true,
-      isCheckingIn: true,
     });
-
-    for (const label of ['切换为当前凭证', '测试凭证', '切换 CodeBuddy 账号', '删除凭证']) {
-      expect(wrapper.get(`[aria-label="${label}"]`).attributes('disabled')).toBeDefined();
-    }
+    expect(wrapper.get('[aria-label="固定当前凭证"]').attributes('disabled')).toBeDefined();
+    expect(wrapper.get('[aria-label="测试凭证"]').attributes('disabled')).toBeDefined();
+    expect(wrapper.findComponent(CActionMenu).props('disabled')).toBe(true);
+    expect(wrapper.findComponent(CActionMenu).props('loading')).toBe(true);
     const state = (wrapper.vm.$ as any).setupState;
     state.selectCredential();
     state.testCredential();
-    state.switchAccount();
-    state.deleteCredential();
+    state.handleMenuAction('checkin');
+    state.handleMenuAction('switchAccount');
+    state.handleMenuAction('refreshQuota');
+    state.handleMenuAction('editQuotaEnterpriseId');
+    state.handleMenuAction('delete');
     expect(wrapper.emitted('select')).toBeUndefined();
     expect(wrapper.emitted('test')).toBeUndefined();
-    expect(wrapper.emitted('switchAccount')).toBeUndefined();
+    expect(wrapper.emitted('checkin')).toBeUndefined();
     expect(wrapper.emitted('delete')).toBeUndefined();
+
+    await wrapper.setProps({ isRefreshingQuota: false, hasActiveTests: true });
+    expect(wrapper.findComponent(CActionMenu).props('disabled')).toBe(true);
+    expect(wrapper.get('[aria-label="测试凭证"]').attributes('disabled')).toBeUndefined();
+    await wrapper.get('[aria-label="测试凭证"]').trigger('click');
+    expect(wrapper.emitted('test')).toEqual([['cred-1']]);
+    await wrapper.setProps({ hasActiveTests: false, writeInProgress: true });
+    expect(wrapper.findComponent(CActionMenu).props('disabled')).toBe(true);
+    expect(wrapper.get('[aria-label="测试凭证"]').attributes('disabled')).toBeDefined();
   });
 
-  it('企业版凭证显示禁用的签到按钮和不支持提示', async () => {
+  it('过期凭证保留企业 ID 入口但禁用并阻止事件', () => {
     const wrapper = mountActions({
-      credential: { ...credential, enterprise_id: 'enterprise' },
-      checkinDisabledReason: '企业版凭证不支持签到',
+      credential: { ...credential, is_expired: true },
+      quotaEnterpriseIdDisabledReason: '凭证已过期，无法修改企业 ID',
     });
+    const item = items(wrapper).find((candidate) => candidate.key === 'editQuotaEnterpriseId');
 
-    expect(wrapper.text()).toContain('企业版凭证不支持签到');
-    expect(wrapper.get('[aria-label="签到"]').attributes('disabled')).toBeDefined();
-    await wrapper.get('[aria-label="签到"]').trigger('click');
-    expect(wrapper.emitted('checkin')).toBeUndefined();
+    expect(item).toMatchObject({
+      label: '标记为企业版',
+      disabled: true,
+      title: '凭证已过期，无法修改企业 ID',
+    });
+    wrapper.findComponent(CActionMenu).vm.$emit('select', 'editQuotaEnterpriseId');
+    expect(wrapper.emitted('editQuotaEnterpriseId')).toBeUndefined();
+  });
+
+  it('当前固定状态正确显示，并通过模态确认删除', async () => {
+    const wrapper = mountActions({ isCurrent: true });
+    expect(wrapper.get('[aria-label="已是当前凭证"]').attributes('disabled')).toBeDefined();
+    expect(wrapper.get('[aria-label="已是当前凭证"]').classes()).toContain(
+      'current-credential-action-button',
+    );
+
+    wrapper.findComponent(CActionMenu).vm.$emit('select', 'delete');
+    await wrapper.vm.$nextTick();
+    const modal = wrapper.findComponent({ name: 'CModal' });
+    expect(modal.props('open')).toBe(true);
+    expect(wrapper.text()).toContain('user@example.com');
+    await wrapper.setProps({ isDeleting: true });
+    (wrapper.vm.$ as any).setupState.closeDeleteModal();
+    (wrapper.vm.$ as any).setupState.confirmDelete();
+    expect(modal.props('open')).toBe(true);
+    expect(wrapper.emitted('delete')).toBeUndefined();
+    await wrapper.setProps({ isDeleting: false });
+    const buttons = wrapper.findAll('.modal-footer button');
+    await buttons[0].trigger('click');
+    expect(modal.props('open')).toBe(false);
+
+    wrapper.findComponent(CActionMenu).vm.$emit('select', 'delete');
+    await wrapper.vm.$nextTick();
+    await wrapper.findAll('.modal-footer button')[1].trigger('click');
+    expect(wrapper.emitted('delete')).toEqual([['cred-1']]);
+
+    await wrapper.setProps({ credential: { ...credential, email: undefined } });
+    expect((wrapper.vm.$ as any).setupState.deleteTitle).toContain('user-1');
+    await wrapper.setProps({ credential: { ...credential, email: undefined, user_id: '' } });
+    expect((wrapper.vm.$ as any).setupState.deleteTitle).toContain('cred-1');
   });
 });

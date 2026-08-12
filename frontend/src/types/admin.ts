@@ -242,6 +242,8 @@ export interface CredentialRecord {
   scope?: string;
   domain?: string;
   enterprise_id?: string;
+  /** 仅用于额度探测，不属于真实 CodeBuddy 账号上下文。 */
+  quota_enterprise_id?: string;
   enterprise_name?: string;
   department_full_name?: string;
   account_type?: string;
@@ -309,6 +311,11 @@ export interface CredentialAccountsResponse {
 export interface CredentialsResponse {
   credentials: CredentialRecord[];
   current: CurrentCredential;
+}
+
+export interface CredentialQuotaEnterpriseIdUpdateResponse {
+  credential: CredentialRecord;
+  quota_refresh_succeeded: boolean;
 }
 
 /** 后端返回的动态设置字段；新增 type 时需同步 SettingsView 的控件分支。 */
