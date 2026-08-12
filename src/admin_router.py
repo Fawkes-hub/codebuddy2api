@@ -13,7 +13,7 @@ from .auth_types import ApiKeyCreateRequest, AuthenticatedUser
 from .codebuddy_api_client import codebuddy_api_client
 from .codebuddy_token_manager import get_token_manager_for_user
 from .credential_refresh import CredentialRefreshError, credential_refresh_manager
-from .credential_quota import credential_quota_manager
+from .credential_quota import CredentialQuotaProbeError, credential_quota_manager
 from .credential_checkin import CredentialCheckinConflict, credential_checkin_manager
 from .models_manager import models_manager
 from .private_response import PrivateNoStoreRoute
@@ -98,6 +98,22 @@ class CredentialCreateRequest(BaseModel):
     ]
 
 
+class CredentialQuotaEnterpriseIdUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enterprise_id: Optional[
+        Annotated[
+            str,
+            StringConstraints(
+                strip_whitespace=True,
+                min_length=1,
+                max_length=256,
+                pattern=r"^[ -~]+$",
+            ),
+        ]
+    ]
+
+
 class CredentialTestRequest(BaseModel):
     message: str = "test"
 
@@ -148,7 +164,11 @@ def _safe_credentials(token_manager, username: Optional[str] = None) -> List[Dic
             quota = credential_quota_manager.get_quota(
                 owner, info["credential_id"],
             )
-            quota["quota_type"] = "enterprise" if info.get("enterprise_id") else "personal"
+            quota["quota_type"] = (
+                "enterprise"
+                if info.get("quota_enterprise_id") or info.get("enterprise_id")
+                else "personal"
+            )
             safe["quota"] = quota
             if credential is not None and not info.get("is_expired") and not info.get("enterprise_id"):
                 checkin = credential_checkin_manager.today_detail_for_credential(
@@ -162,6 +182,58 @@ def _safe_credentials(token_manager, username: Optional[str] = None) -> List[Dic
 
 def _credential_not_found() -> HTTPException:
     return HTTPException(status_code=404, detail="Credential not found")
+
+
+def _quota_credential_snapshot(token_manager, credential_id: str):
+    snapshot = token_manager.snapshot_credential_by_id(credential_id)
+    if snapshot is None:
+        raise _credential_not_found()
+    credential, generation = snapshot
+    if token_manager.is_token_expired(credential):
+        raise HTTPException(status_code=409, detail="已过期凭证无法探测额度")
+    return credential, generation
+
+
+def _manual_quota_credential_snapshot(token_manager, credential_id: str):
+    credential, generation = _quota_credential_snapshot(token_manager, credential_id)
+    if credential.get("auth_source", "manual") != "manual":
+        raise HTTPException(status_code=409, detail="仅手动添加的凭证可设置企业 ID")
+    if credential.get("enterprise_id"):
+        raise HTTPException(status_code=409, detail="真实企业凭证无需设置额度企业 ID")
+    return credential, generation
+
+
+def _replace_quota_credential(
+        token_manager,
+        credential_id: str,
+        credential: Dict[str, Any],
+        generation: int,
+) -> None:
+    try:
+        replaced = token_manager.replace_credential_by_id(
+            credential_id,
+            credential,
+            expected_generation=generation,
+            quota_changed=True,
+        )
+    except Exception as error:
+        logger.error("保存额度企业 ID 失败：凭证=%s，错误=%s", credential_id, type(error).__name__)
+        raise HTTPException(status_code=500, detail="保存凭证失败") from error
+    if not replaced:
+        raise HTTPException(status_code=409, detail="凭证已发生变化，请重试")
+
+
+def _safe_credential_by_id(token_manager, username: str, credential_id: str) -> Dict[str, Any]:
+    credential = next(
+        (
+            item for item in _safe_credentials(token_manager, username)
+            if item.get("credential_id") == credential_id
+        ),
+        None,
+    )
+    if credential is None:
+        raise HTTPException(status_code=409, detail="凭证已发生变化，请刷新后重试")
+    return credential
 
 
 def get_stream_service_factory() -> Callable[[], CodeBuddyStreamService]:
@@ -379,6 +451,105 @@ async def manual_admin_credential_checkin(
             status_code=409,
             detail=details.get(reason, "当前无法执行签到"),
         ) from error
+
+
+@router.put("/credentials/{credential_id}/quota-enterprise-id")
+async def update_admin_credential_quota_enterprise_id(
+        credential_id: str,
+        request_body: CredentialQuotaEnterpriseIdUpdate,
+        _user: AuthenticatedUser = Depends(require_session_user),
+):
+    """设置仅用于额度探测的企业 ID，或删除标记并切回个人版探测。"""
+    token_manager = get_token_manager_for_user(_user)
+    credential, generation = _manual_quota_credential_snapshot(token_manager, credential_id)
+    enterprise_id = request_body.enterprise_id
+    if credential.get("quota_enterprise_id") == enterprise_id:
+        quota = await credential_quota_manager.probe_credential(
+            _user.username,
+            token_manager,
+            credential_id,
+        )
+        current_snapshot = token_manager.snapshot_credential_by_id(credential_id)
+        if current_snapshot is None:
+            raise HTTPException(status_code=409, detail="凭证已发生变化，请重试")
+        current_credential, current_generation = current_snapshot
+        if (
+                current_generation,
+                current_credential.get("quota_enterprise_id"),
+        ) != (generation, enterprise_id):
+            raise HTTPException(status_code=409, detail="凭证已发生变化，请重试")
+        refresh_succeeded = bool(quota and quota.get("status") == "fresh")
+        if enterprise_id is not None and not refresh_succeeded:
+            raise HTTPException(
+                status_code=422,
+                detail="无法探测额度，请检测企业ID是否正确",
+            )
+        return {
+            "credential": _safe_credential_by_id(
+                token_manager, _user.username, credential_id,
+            ),
+            "quota_refresh_succeeded": refresh_succeeded,
+        }
+    if enterprise_id is not None:
+        candidate = credential.copy()
+        candidate["quota_enterprise_id"] = enterprise_id
+        try:
+            quota = await credential_quota_manager.probe_candidate(candidate)
+        except CredentialQuotaProbeError as error:
+            raise HTTPException(
+                status_code=422,
+                detail="无法探测额度，请检测企业ID是否正确",
+            ) from error
+        _replace_quota_credential(
+            token_manager,
+            credential_id,
+            candidate,
+            generation,
+        )
+        credential_quota_manager.invalidate_credential(_user.username, credential_id)
+        credential_quota_manager.publish_probe_result(_user.username, credential_id, quota)
+        return {
+            "credential": _safe_credential_by_id(
+                token_manager, _user.username, credential_id,
+            ),
+            "quota_refresh_succeeded": True,
+        }
+
+    credential.pop("quota_enterprise_id", None)
+    _replace_quota_credential(
+        token_manager,
+        credential_id,
+        credential,
+        generation,
+    )
+    credential_quota_manager.invalidate_credential(_user.username, credential_id)
+    quota = await credential_quota_manager.probe_credential(
+        _user.username,
+        token_manager,
+        credential_id,
+    )
+    return {
+        "credential": _safe_credential_by_id(token_manager, _user.username, credential_id),
+        "quota_refresh_succeeded": bool(quota and quota.get("status") == "fresh"),
+    }
+
+
+@router.post("/credentials/{credential_id}/quota/refresh")
+async def refresh_admin_credential_quota(
+        credential_id: str,
+        _user: AuthenticatedUser = Depends(require_session_user),
+):
+    """立即刷新指定有效凭证的额度，不经过后台启动节流器。"""
+    token_manager = get_token_manager_for_user(_user)
+    _quota_credential_snapshot(token_manager, credential_id)
+    quota = await credential_quota_manager.probe_credential(
+        _user.username,
+        token_manager,
+        credential_id,
+    )
+    if not quota or quota.get("status") != "fresh":
+        raise HTTPException(status_code=502, detail="额度刷新失败")
+    return {"quota": quota}
 
 
 @router.delete("/credentials/{credential_id}")

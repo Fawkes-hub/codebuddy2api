@@ -238,6 +238,66 @@ class CredentialQuotaManagerTests(ConfigIsolationMixin, unittest.IsolatedAsyncio
         self.assertEqual(kwargs["headers"]["Authorization"], "Bearer enterprise-secret")
         self.assertEqual(kwargs["headers"]["X-Enterprise-Id"], "enterprise-1")
 
+    async def test_manual_quota_enterprise_id_only_changes_quota_probe_context(self):
+        self.assertTrue(self.manager.add_credential_with_data({
+            "bearer_token": "manual-enterprise-secret",
+            "user_id": "manual-enterprise-user",
+            "account_uid": "manual-enterprise-account",
+            "quota_enterprise_id": "quota-enterprise-1",
+            "auth_source": "manual",
+        }, "manual-enterprise.json"))
+        credential_id = next(
+            item["credential_id"]
+            for item in self.manager.get_credentials_info()
+            if item.get("quota_enterprise_id")
+        )
+        manager, client = self.quota_manager([enterprise_quota_response()])
+
+        result = await manager.probe_credential("admin", self.manager, credential_id)
+
+        self.assertEqual(result["quota_type"], "enterprise")
+        url, kwargs = client.requests[0]
+        self.assertTrue(url.endswith("/v2/billing/meter/get-enterprise-user-usage"))
+        self.assertEqual(kwargs["headers"]["X-Enterprise-Id"], "quota-enterprise-1")
+        self.assertEqual(kwargs["headers"]["X-Tenant-Id"], "quota-enterprise-1")
+        stored = self.manager.get_credential_by_id(credential_id)
+        self.assertNotIn("enterprise_id", stored)
+        self.assertEqual(stored["quota_enterprise_id"], "quota-enterprise-1")
+
+    async def test_candidate_probe_does_not_publish_until_explicitly_committed(self):
+        manager, _client = self.quota_manager([enterprise_quota_response()])
+        credential = dict(self.manager.get_credential_by_id(self.credential_id))
+        credential["quota_enterprise_id"] = "candidate-enterprise"
+
+        result = await manager.probe_candidate(credential)
+
+        self.assertEqual(result["status"], "fresh")
+        self.assertEqual(result["quota_type"], "enterprise")
+        self.assertEqual(manager.get_quota("admin", self.credential_id)["status"], "unknown")
+
+        manager.publish_probe_result("admin", self.credential_id, result)
+        self.assertEqual(manager.get_quota("admin", self.credential_id), result)
+        result["remaining"] = -1
+        self.assertEqual(manager.get_quota("admin", self.credential_id)["remaining"], 64.5)
+
+    async def test_candidate_probe_normalizes_known_transport_failure(self):
+        manager, _client = self.quota_manager([httpx.ConnectError("private")])
+
+        with self.assertRaisesRegex(CredentialQuotaProbeError, "transport_error"):
+            await manager.probe_candidate(self.manager.get_credential_by_id(self.credential_id))
+
+    async def test_candidate_probe_preserves_normalized_probe_failure(self):
+        manager, _client = self.quota_manager([])
+        failure = CredentialQuotaProbeError("invalid_response")
+
+        with (
+            mock.patch.object(manager, "_fetch_quota", new=mock.AsyncMock(side_effect=failure)),
+            self.assertRaises(CredentialQuotaProbeError) as raised,
+        ):
+            await manager.probe_candidate(self.manager.get_credential_by_id(self.credential_id))
+
+        self.assertIs(raised.exception, failure)
+
     def test_enterprise_response_validation_and_integer_overage(self):
         integer = CredentialQuotaManager._parse_enterprise_response(
             enterprise_quota_response(credit=40, limitNum=100).payload

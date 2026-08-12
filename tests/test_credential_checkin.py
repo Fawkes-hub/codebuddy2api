@@ -198,7 +198,11 @@ class CredentialCheckinManagerTests(ConfigIsolationMixin, unittest.IsolatedAsync
         self.registry = CodeBuddyTokenManagerRegistry()
         self.token_manager = self.registry.for_username("alice")
         self.assertTrue(self.token_manager.add_credential_with_data(
-            {"bearer_token": "token", "user_id": "upstream-user"},
+            {
+                "bearer_token": "token",
+                "user_id": "upstream-user",
+                "quota_enterprise_id": "quota-only-enterprise",
+            },
             "credential.json",
         ))
         self.credential_id = self.token_manager.get_credentials_info()[0]["credential_id"]
@@ -238,6 +242,8 @@ class CredentialCheckinManagerTests(ConfigIsolationMixin, unittest.IsolatedAsync
         self.assertEqual(client.requests[0]["url"], "https://copilot.tencent.com/billing/meter/daily-checkin")
         self.assertEqual(client.requests[0]["json"], {})
         self.assertEqual(client.requests[0]["headers"]["X-User-Id"], "upstream-user")
+        self.assertNotIn("X-Enterprise-Id", client.requests[0]["headers"])
+        self.assertNotIn("X-Tenant-Id", client.requests[0]["headers"])
 
     async def test_success_refreshes_quota_for_all_credentials_of_same_account(self):
         self.assertTrue(self.token_manager.add_credential_with_data(

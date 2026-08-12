@@ -50,6 +50,15 @@ def _unknown_quota(quota_type: Optional[str] = None) -> Dict[str, Any]:
     }
 
 
+def _quota_enterprise_id(credential: Dict[str, Any]) -> Any:
+    """返回仅用于额度探测的企业上下文，不改变凭证的真实账号上下文。"""
+    return credential.get("quota_enterprise_id") or credential.get("enterprise_id")
+
+
+def _quota_type(credential: Dict[str, Any]) -> str:
+    return "enterprise" if _quota_enterprise_id(credential) else "personal"
+
+
 def _nonnegative_decimal(value: Any) -> Decimal:
     if isinstance(value, bool):
         raise CredentialQuotaProbeError("invalid_response")
@@ -332,7 +341,7 @@ class CredentialQuotaManager:
         credential = manager.get_credential_by_id(credential_id)
         if credential is None or manager.is_token_expired(credential):
             return None
-        quota_type = "enterprise" if credential.get("enterprise_id") else "personal"
+        quota_type = _quota_type(credential)
         with self._lock:
             usage_at_start = self._usage_totals.get(key, 0.0)
             invalidation_at_start = self._invalidations.get(key, 0)
@@ -363,22 +372,63 @@ class CredentialQuotaManager:
             if self._invalidations.get(key, 0) != invalidation_at_start:
                 return deepcopy(self._cache.get(key, _unknown_quota(quota_type)))
             concurrent_credit = max(0.0, self._usage_totals.get(key, 0.0) - usage_at_start)
-            remaining = max(0.0, float(snapshot["remaining"]) - concurrent_credit)
-            entry = {
-                **snapshot,
-                "status": "fresh",
-                "quota_type": quota_type,
-                "remaining": remaining,
-                "remaining_percent": _remaining_percent(remaining, snapshot["total"]),
-                "estimated": concurrent_credit > 0,
-                "estimated_credit_since_sync": concurrent_credit,
-                "last_attempt_at": attempted_at,
-                "last_success_at": attempted_at,
-                "last_estimated_at": attempted_at if concurrent_credit > 0 else None,
-                "error_type": None,
-            }
+            entry = self._fresh_entry(
+                snapshot,
+                quota_type=quota_type,
+                attempted_at=attempted_at,
+                concurrent_credit=concurrent_credit,
+            )
             self._cache[key] = entry
             return deepcopy(entry)
+
+    @staticmethod
+    def _fresh_entry(
+            snapshot: Dict[str, Any],
+            *,
+            quota_type: str,
+            attempted_at: int,
+            concurrent_credit: float = 0.0,
+    ) -> Dict[str, Any]:
+        remaining = max(0.0, float(snapshot["remaining"]) - concurrent_credit)
+        return {
+            **snapshot,
+            "status": "fresh",
+            "quota_type": quota_type,
+            "remaining": remaining,
+            "remaining_percent": _remaining_percent(remaining, snapshot["total"]),
+            "estimated": concurrent_credit > 0,
+            "estimated_credit_since_sync": concurrent_credit,
+            "last_attempt_at": attempted_at,
+            "last_success_at": attempted_at,
+            "last_estimated_at": attempted_at if concurrent_credit > 0 else None,
+            "error_type": None,
+        }
+
+    async def probe_candidate(self, credential: Dict[str, Any]) -> Dict[str, Any]:
+        """探测尚未持久化的凭证额度上下文，不读取或写入额度缓存。"""
+        attempted_at = int(self._now_factory())
+        try:
+            snapshot = await self._fetch_quota(credential)
+        except CredentialQuotaProbeError:
+            raise
+        except (httpx.HTTPError, TimeoutError) as error:
+            raise CredentialQuotaProbeError("transport_error") from error
+        return self._fresh_entry(
+            snapshot,
+            quota_type=_quota_type(credential),
+            attempted_at=attempted_at,
+        )
+
+    def publish_probe_result(
+            self,
+            username: str,
+            credential_id: str,
+            result: Dict[str, Any],
+    ) -> None:
+        """在凭证上下文已原子提交后发布对应的成功额度快照。"""
+        key = self._cache_key(username, credential_id)
+        with self._lock:
+            self._cache[key] = deepcopy(result)
 
     async def _fetch_quota(
             self,
@@ -389,19 +439,20 @@ class CredentialQuotaManager:
         bearer_token = credential.get("bearer_token")
         if not bearer_token:
             raise CredentialQuotaProbeError("authentication_error")
+        enterprise_id = _quota_enterprise_id(credential)
         try:
             headers = codebuddy_api_client.generate_codebuddy_headers(
                 bearer_token=bearer_token,
                 user_id=credential.get("user_id"),
                 account_uid=credential.get("account_uid"),
                 domain=credential.get("domain"),
-                enterprise_id=credential.get("enterprise_id"),
+                enterprise_id=enterprise_id,
                 department_full_name=credential.get("department_full_name"),
             )
         except (TypeError, ValueError) as error:
             raise CredentialQuotaProbeError("authentication_error") from error
         headers["Accept"] = "application/json, text/plain, */*"
-        is_enterprise = bool(credential.get("enterprise_id"))
+        is_enterprise = bool(enterprise_id)
         if is_enterprise:
             path = "/v2/billing/meter/get-enterprise-user-usage"
             payload = {}

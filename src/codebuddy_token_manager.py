@@ -261,6 +261,7 @@ class CodeBuddyTokenManager:
                     "scope": data.get("scope"),
                     "domain": data.get("domain"),
                     "enterprise_id": data.get("enterprise_id"),
+                    "quota_enterprise_id": data.get("quota_enterprise_id"),
                     "enterprise_name": data.get("enterprise_name"),
                     "department_full_name": data.get("department_full_name"),
                     "account_type": data.get("account_type"),

@@ -124,13 +124,19 @@ class ModelsManagerTests(ConfigIsolationMixin, unittest.IsolatedAsyncioTestCase)
         models = await manager.get_actual_models_for_credential(
             self._user(),
             "international-credential",
-            {"bearer_token": "international-token", "user_id": "user-id"},
+            {
+                "bearer_token": "international-token",
+                "user_id": "user-id",
+                "quota_enterprise_id": "quota-only-enterprise",
+            },
         )
 
         self.assertEqual(models, ["international-model"])
         self.assertEqual(client.requests[0]["url"], "https://www.codebuddy.ai/v3/config")
         self.assertEqual(client.requests[0]["headers"]["Host"], "www.codebuddy.ai")
         self.assertEqual(client.requests[0]["headers"]["X-Domain"], "www.codebuddy.ai")
+        self.assertNotIn("X-Enterprise-Id", client.requests[0]["headers"])
+        self.assertNotIn("X-Tenant-Id", client.requests[0]["headers"])
 
     async def test_configured_models_are_user_scoped(self):
         config.update_settings({"CODEBUDDY_MODELS": "admin-model"}, username="admin")
