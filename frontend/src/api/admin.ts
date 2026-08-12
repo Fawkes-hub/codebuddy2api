@@ -7,7 +7,8 @@ import type {
   CodeBuddyPollAuthResponse,
   CredentialRecord,
   CredentialQuota,
-  CredentialQuotaEnterpriseIdUpdateResponse,
+  CredentialQuotaProbeMode,
+  CredentialQuotaProbeModeUpdateResponse,
   CredentialDailyCheckin,
   CredentialAccountsResponse,
   CredentialsResponse,
@@ -125,12 +126,12 @@ export const adminApi = {
       `/api/admin/credentials/${encodeURIComponent(credentialId)}/quota/refresh`,
       { method: 'POST', timeoutMs: QUOTA_PROBE_TIMEOUT_MS },
     ),
-  updateCredentialQuotaEnterpriseId: (credentialId: string, enterpriseId: string | null) =>
-    apiRequest<CredentialQuotaEnterpriseIdUpdateResponse>(
-      `/api/admin/credentials/${encodeURIComponent(credentialId)}/quota-enterprise-id`,
+  updateCredentialQuotaProbeMode: (credentialId: string, mode: CredentialQuotaProbeMode) =>
+    apiRequest<CredentialQuotaProbeModeUpdateResponse>(
+      `/api/admin/credentials/${encodeURIComponent(credentialId)}/quota-probe-mode`,
       {
         method: 'PUT',
-        json: { enterprise_id: enterpriseId },
+        json: { mode },
         timeoutMs: QUOTA_PROBE_TIMEOUT_MS,
       },
     ),

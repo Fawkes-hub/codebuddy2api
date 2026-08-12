@@ -6,7 +6,7 @@ import logging
 import secrets
 import time
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Literal, Optional, cast
 from urllib.parse import urlparse, urlsplit
 
 import httpx
@@ -23,6 +23,16 @@ AUTH_STATE_TTL_SECONDS = 600
 AUTH_MAX_ACTIVE_PER_USER = 3
 AUTH_MAX_START_ATTEMPTS = 5
 AUTH_START_WINDOW_SECONDS = 60
+
+CredentialAuthSource = Literal["manual", "oauth", "unknown"]
+_CREDENTIAL_AUTH_SOURCES = frozenset(("manual", "oauth", "unknown"))
+
+
+def normalize_credential_auth_source(value: Any) -> CredentialAuthSource:
+    """只接受可信来源标记；历史缺失值或无效值统一视为来源未知。"""
+    if isinstance(value, str) and value in _CREDENTIAL_AUTH_SOURCES:
+        return cast(CredentialAuthSource, value)
+    return "unknown"
 
 AUTH_ERROR_DETAILS = {
     12005: ("license_seat_limit", "企业许可证没有可用席位"),
@@ -551,7 +561,13 @@ class TokenParser:
         return {key: value for key, value in normalized.items() if value is not None}
 
     @staticmethod
-    def build_credential_data(token_data: Dict[str, Any]) -> Dict[str, Any]:
+    def build_credential_data(
+            token_data: Dict[str, Any],
+            *,
+            auth_source: CredentialAuthSource,
+    ) -> Dict[str, Any]:
+        if auth_source not in _CREDENTIAL_AUTH_SOURCES:
+            raise ValueError("invalid credential auth source")
         provided_created_at = token_data.get("created_at")
         created_at = (
             int(provided_created_at)
@@ -614,9 +630,9 @@ class TokenParser:
             "enterprise_id": enterprise_id,
             "session_state": token_data.get("session_state"),
             "user_info": user_info,
-            "auth_source": "oauth" if account or upstream_responses else "manual",
-            "auth_platform": "CLI" if account or upstream_responses else None,
-            "auth_client_version": "2.107.0" if account or upstream_responses else None,
+            "auth_source": auth_source,
+            "auth_platform": "CLI" if auth_source == "oauth" else None,
+            "auth_client_version": "2.107.0" if auth_source == "oauth" else None,
             "api_endpoint": api_endpoint,
             "site_type": TokenParser._site_type(api_endpoint),
             "account_uid": account.get("uid") if account else None,
@@ -718,7 +734,10 @@ class CodeBuddyTokenSaver:
         try:
             from .codebuddy_token_manager import get_token_manager_for_user
 
-            credential_data = TokenParser.build_credential_data(token_data)
+            credential_data = TokenParser.build_credential_data(
+                token_data,
+                auth_source="oauth",
+            )
             user_id = credential_data.get("user_id", "unknown")
             filename = build_user_credential_filename(user_id)
 

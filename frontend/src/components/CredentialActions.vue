@@ -30,8 +30,8 @@ interface Props {
   isCheckingIn?: boolean;
   checkinDisabledReason?: string;
   isRefreshingQuota?: boolean;
-  canEditQuotaEnterpriseId?: boolean;
-  quotaEnterpriseIdDisabledReason?: string;
+  canEditQuotaProbeMode?: boolean;
+  quotaProbeModeDisabledReason?: string;
 }
 
 interface MenuItem {
@@ -55,8 +55,8 @@ const props = withDefaults(defineProps<Props>(), {
   isCheckingIn: false,
   checkinDisabledReason: '',
   isRefreshingQuota: false,
-  canEditQuotaEnterpriseId: false,
-  quotaEnterpriseIdDisabledReason: '',
+  canEditQuotaProbeMode: false,
+  quotaProbeModeDisabledReason: '',
 });
 
 const emit = defineEmits<{
@@ -66,7 +66,7 @@ const emit = defineEmits<{
   switchAccount: [credentialId: string];
   checkin: [credentialId: string];
   refreshQuota: [credentialId: string];
-  editQuotaEnterpriseId: [credentialId: string];
+  editQuotaProbeMode: [credentialId: string];
 }>();
 
 const deleteModalOpen = ref(false);
@@ -142,13 +142,13 @@ const menuItems = computed<MenuItem[]>(() => {
     disabled: actionsBlocked.value || props.credential.is_expired,
     title: props.credential.is_expired ? '凭证已过期，无法刷新额度' : undefined,
   });
-  if (props.canEditQuotaEnterpriseId) {
+  if (props.canEditQuotaProbeMode) {
     items.push({
-      key: 'editQuotaEnterpriseId',
-      label: props.credential.quota_enterprise_id ? '修改企业ID' : '标记为企业版',
+      key: 'editQuotaProbeMode',
+      label: '额度探测方式',
       icon: Pencil,
-      disabled: actionsBlocked.value || Boolean(props.quotaEnterpriseIdDisabledReason),
-      title: props.quotaEnterpriseIdDisabledReason || undefined,
+      disabled: actionsBlocked.value || Boolean(props.quotaProbeModeDisabledReason),
+      title: props.quotaProbeModeDisabledReason || undefined,
     });
   }
   items.push({
@@ -179,11 +179,11 @@ function handleMenuAction(key: string): void {
   } else if (key === 'refreshQuota' && !props.credential.is_expired) {
     emit('refreshQuota', props.credential.credential_id);
   } else if (
-    key === 'editQuotaEnterpriseId' &&
-    props.canEditQuotaEnterpriseId &&
-    !props.quotaEnterpriseIdDisabledReason
+    key === 'editQuotaProbeMode' &&
+    props.canEditQuotaProbeMode &&
+    !props.quotaProbeModeDisabledReason
   ) {
-    emit('editQuotaEnterpriseId', props.credential.credential_id);
+    emit('editQuotaProbeMode', props.credential.credential_id);
   } else if (key === 'delete') {
     deleteModalOpen.value = true;
   }

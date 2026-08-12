@@ -81,6 +81,7 @@ class CredentialRefreshManagerTests(ConfigIsolationMixin, unittest.IsolatedAsync
             "domain": "copilot.tencent.com",
             "created_at": 900_000,
             "expires_at": 1_000_000,
+            "auth_source": "oauth",
         }
         value.update(overrides)
         return value
@@ -482,11 +483,13 @@ class CredentialRefreshManagerTests(ConfigIsolationMixin, unittest.IsolatedAsync
         pending = manager.replacements[0][1]
         completed = manager.replacements[1][1]
         self.assertEqual(pending["refresh_token"], "new-refresh")
+        self.assertEqual(pending["auth_source"], "oauth")
         self.assertTrue(pending["refresh_accounts_pending"])
         self.assertEqual(pending["compatibility_data"], {"legacy": True})
         self.assertEqual(pending["upstream_responses"]["login_token"], {"raw": True})
         self.assertEqual(manager.replacements[0][2], 4)
         self.assertNotIn("refresh_accounts_pending", completed)
+        self.assertEqual(completed["auth_source"], "oauth")
         self.assertEqual(manager.replacements[1][2], 5)
 
     async def test_refresh_repairs_stale_enterprise_context_for_personal_account(self):

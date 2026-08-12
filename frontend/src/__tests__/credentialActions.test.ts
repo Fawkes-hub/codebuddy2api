@@ -41,7 +41,7 @@ function mountActions(overrides: Record<string, unknown> = {}) {
       isCurrent: false,
       isTesting: false,
       canCheckIn: true,
-      canEditQuotaEnterpriseId: true,
+      canEditQuotaProbeMode: true,
       ...overrides,
     },
     global: { stubs: { CActionMenu: ActionMenuStub, CModal: ModalStub } },
@@ -59,7 +59,7 @@ describe('CredentialActions', () => {
     expect(items(wrapper).map((item) => item.label)).toEqual([
       '签到',
       '刷新额度',
-      '标记为企业版',
+      '额度探测方式',
       '删除凭证',
     ]);
     expect(items(wrapper).every((item) => item.icon)).toBe(true);
@@ -74,29 +74,29 @@ describe('CredentialActions', () => {
     const menu = wrapper.findComponent(CActionMenu);
     menu.vm.$emit('select', 'checkin');
     menu.vm.$emit('select', 'refreshQuota');
-    menu.vm.$emit('select', 'editQuotaEnterpriseId');
+    menu.vm.$emit('select', 'editQuotaProbeMode');
     (wrapper.vm.$ as any).setupState.handleMenuAction('unknown');
     expect(wrapper.emitted('checkin')).toEqual([['cred-1']]);
     expect(wrapper.emitted('refreshQuota')).toEqual([['cred-1']]);
-    expect(wrapper.emitted('editQuotaEnterpriseId')).toEqual([['cred-1']]);
+    expect(wrapper.emitted('editQuotaProbeMode')).toEqual([['cred-1']]);
   });
 
-  it('按凭证能力显示账号切换与企业标记文案', async () => {
+  it('按凭证能力显示账号切换与额度探测方式入口', async () => {
     const wrapper = mountActions({
       canSwitchAccount: true,
-      credential: { ...credential, quota_enterprise_id: 'enterprise-1' },
+      credential: { ...credential, quota_probe_mode: 'enterprise' },
     });
     expect(items(wrapper).map((item) => item.label)).toEqual([
       '签到',
       '切换 CodeBuddy 账号',
       '刷新额度',
-      '修改企业ID',
+      '额度探测方式',
       '删除凭证',
     ]);
     wrapper.findComponent(CActionMenu).vm.$emit('select', 'switchAccount');
     expect(wrapper.emitted('switchAccount')).toEqual([['cred-1']]);
 
-    await wrapper.setProps({ canSwitchAccount: false, canEditQuotaEnterpriseId: false });
+    await wrapper.setProps({ canSwitchAccount: false, canEditQuotaProbeMode: false });
     expect(items(wrapper).map((item) => item.label)).toEqual(['签到', '刷新额度', '删除凭证']);
     await wrapper.setProps({ canCheckIn: false });
     expect(items(wrapper).map((item) => item.label)).toEqual(['刷新额度', '删除凭证']);
@@ -180,7 +180,7 @@ describe('CredentialActions', () => {
     state.handleMenuAction('checkin');
     state.handleMenuAction('switchAccount');
     state.handleMenuAction('refreshQuota');
-    state.handleMenuAction('editQuotaEnterpriseId');
+    state.handleMenuAction('editQuotaProbeMode');
     state.handleMenuAction('delete');
     expect(wrapper.emitted('select')).toBeUndefined();
     expect(wrapper.emitted('test')).toBeUndefined();
@@ -197,20 +197,20 @@ describe('CredentialActions', () => {
     expect(wrapper.get('[aria-label="测试凭证"]').attributes('disabled')).toBeDefined();
   });
 
-  it('过期凭证保留企业 ID 入口但禁用并阻止事件', () => {
+  it('过期凭证保留额度探测方式入口但禁用并阻止事件', () => {
     const wrapper = mountActions({
       credential: { ...credential, is_expired: true },
-      quotaEnterpriseIdDisabledReason: '凭证已过期，无法修改企业 ID',
+      quotaProbeModeDisabledReason: '凭证已过期，无法修改额度探测方式',
     });
-    const item = items(wrapper).find((candidate) => candidate.key === 'editQuotaEnterpriseId');
+    const item = items(wrapper).find((candidate) => candidate.key === 'editQuotaProbeMode');
 
     expect(item).toMatchObject({
-      label: '标记为企业版',
+      label: '额度探测方式',
       disabled: true,
-      title: '凭证已过期，无法修改企业 ID',
+      title: '凭证已过期，无法修改额度探测方式',
     });
-    wrapper.findComponent(CActionMenu).vm.$emit('select', 'editQuotaEnterpriseId');
-    expect(wrapper.emitted('editQuotaEnterpriseId')).toBeUndefined();
+    wrapper.findComponent(CActionMenu).vm.$emit('select', 'editQuotaProbeMode');
+    expect(wrapper.emitted('editQuotaProbeMode')).toBeUndefined();
   });
 
   it('当前固定状态正确显示，并通过模态确认删除', async () => {

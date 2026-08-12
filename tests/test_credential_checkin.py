@@ -201,7 +201,7 @@ class CredentialCheckinManagerTests(ConfigIsolationMixin, unittest.IsolatedAsync
             {
                 "bearer_token": "token",
                 "user_id": "upstream-user",
-                "quota_enterprise_id": "quota-only-enterprise",
+                "quota_probe_mode": "enterprise",
             },
             "credential.json",
         ))

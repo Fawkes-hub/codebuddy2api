@@ -50,13 +50,13 @@ def _unknown_quota(quota_type: Optional[str] = None) -> Dict[str, Any]:
     }
 
 
-def _quota_enterprise_id(credential: Dict[str, Any]) -> Any:
-    """返回仅用于额度探测的企业上下文，不改变凭证的真实账号上下文。"""
-    return credential.get("quota_enterprise_id") or credential.get("enterprise_id")
-
-
 def _quota_type(credential: Dict[str, Any]) -> str:
-    return "enterprise" if _quota_enterprise_id(credential) else "personal"
+    """真实企业凭证固定探测企业额度，手动凭证可单独选择额度探测方式。"""
+    return (
+        "enterprise"
+        if credential.get("enterprise_id") or credential.get("quota_probe_mode") == "enterprise"
+        else "personal"
+    )
 
 
 def _nonnegative_decimal(value: Any) -> Decimal:
@@ -439,7 +439,7 @@ class CredentialQuotaManager:
         bearer_token = credential.get("bearer_token")
         if not bearer_token:
             raise CredentialQuotaProbeError("authentication_error")
-        enterprise_id = _quota_enterprise_id(credential)
+        enterprise_id = credential.get("enterprise_id")
         try:
             headers = codebuddy_api_client.generate_codebuddy_headers(
                 bearer_token=bearer_token,
@@ -452,7 +452,7 @@ class CredentialQuotaManager:
         except (TypeError, ValueError) as error:
             raise CredentialQuotaProbeError("authentication_error") from error
         headers["Accept"] = "application/json, text/plain, */*"
-        is_enterprise = bool(enterprise_id)
+        is_enterprise = _quota_type(credential) == "enterprise"
         if is_enterprise:
             path = "/v2/billing/meter/get-enterprise-user-usage"
             payload = {}

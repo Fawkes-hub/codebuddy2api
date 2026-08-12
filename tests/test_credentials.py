@@ -499,7 +499,7 @@ class TokenManagerTests(ConfigIsolationMixin, unittest.TestCase):
             self.assertEqual(info["nickname"], "昵称")
             self.assertEqual(info["preferred_username"], "preferred-user")
 
-    def test_load_normalizes_bearer_only_manual_credential_without_account_fields(self):
+    def test_load_marks_legacy_credential_without_source_as_unknown(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             path = Path(tmp_dir) / "manual.json"
             path.write_text(json.dumps({"bearer_token": "opaque.12345678"}), encoding="utf-8")
@@ -509,10 +509,32 @@ class TokenManagerTests(ConfigIsolationMixin, unittest.TestCase):
             credential = manager.get_all_credentials()[0]
 
             self.assertEqual(credential["user_id"], "anonymous_12345678")
-            self.assertEqual(credential["auth_source"], "manual")
+            self.assertEqual(credential["auth_source"], "unknown")
             self.assertNotIn("account_uid", credential)
             self.assertNotIn("refresh_token", credential)
             self.assertFalse(manager.is_token_expired(credential))
+
+    def test_new_manual_credential_has_explicit_source_and_invalid_source_is_unknown(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            manager = CodeBuddyTokenManager(creds_dir=tmp_dir)
+            self.assertTrue(manager.add_credential("opaque.12345678"))
+            manual = manager.get_all_credentials()[0]
+            self.assertEqual(manual["auth_source"], "manual")
+            self.assertEqual(manager.get_credentials_info()[0]["auth_source"], "manual")
+
+            self.assertTrue(add_credential(
+                manager,
+                "other.12345678",
+                "other",
+                "unknown.json",
+                credential_schema_version=2,
+                auth_source="invalid",
+            ))
+            info = next(
+                item for item in manager.get_credentials_info()
+                if item["filename"] == "unknown.json"
+            )
+            self.assertEqual(info["auth_source"], "unknown")
 
     def test_load_migrates_legacy_full_response_and_explicit_expiry_metadata(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -739,7 +761,10 @@ class TokenManagerTests(ConfigIsolationMixin, unittest.TestCase):
             credential = manager.get_credentials_info()[0]
             self.assertEqual(credential["user_id"], "anonymous_1a2B.c_D")
             self.assertEqual(
-                TokenParser.build_credential_data({"bearer_token": bearer_token})["user_id"],
+                TokenParser.build_credential_data(
+                    {"bearer_token": bearer_token},
+                    auth_source="manual",
+                )["user_id"],
                 credential["user_id"],
             )
 

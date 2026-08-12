@@ -1,7 +1,7 @@
 """管理页专用 API 路由。"""
 import logging
 import time
-from typing import Annotated, Any, Callable, Dict, List, Optional
+from typing import Annotated, Any, Callable, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, StringConstraints
@@ -98,20 +98,10 @@ class CredentialCreateRequest(BaseModel):
     ]
 
 
-class CredentialQuotaEnterpriseIdUpdate(BaseModel):
+class CredentialQuotaProbeModeUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    enterprise_id: Optional[
-        Annotated[
-            str,
-            StringConstraints(
-                strip_whitespace=True,
-                min_length=1,
-                max_length=256,
-                pattern=r"^[ -~]+$",
-            ),
-        ]
-    ]
+    mode: Literal["personal", "enterprise"]
 
 
 class CredentialTestRequest(BaseModel):
@@ -149,6 +139,9 @@ def _safe_credential(info: Dict[str, Any], credential: Optional[Dict[str, Any]])
     safe_info["time_remaining_str"] = _time_remaining_text(info.get("time_remaining"))
     safe_info["has_token"] = bool(bearer_token)
     safe_info["token_display"] = token_display
+    safe_info["can_edit_quota_probe_mode"] = (
+        info.get("auth_source") == "manual" and not info.get("enterprise_id")
+    )
     return safe_info
 
 
@@ -166,7 +159,7 @@ def _safe_credentials(token_manager, username: Optional[str] = None) -> List[Dic
             )
             quota["quota_type"] = (
                 "enterprise"
-                if info.get("quota_enterprise_id") or info.get("enterprise_id")
+                if info.get("enterprise_id") or info.get("quota_probe_mode") == "enterprise"
                 else "personal"
             )
             safe["quota"] = quota
@@ -196,10 +189,10 @@ def _quota_credential_snapshot(token_manager, credential_id: str):
 
 def _manual_quota_credential_snapshot(token_manager, credential_id: str):
     credential, generation = _quota_credential_snapshot(token_manager, credential_id)
-    if credential.get("auth_source", "manual") != "manual":
-        raise HTTPException(status_code=409, detail="仅手动添加的凭证可设置企业 ID")
+    if credential.get("auth_source") != "manual":
+        raise HTTPException(status_code=409, detail="仅明确手动添加的凭证可修改额度探测方式")
     if credential.get("enterprise_id"):
-        raise HTTPException(status_code=409, detail="真实企业凭证无需设置额度企业 ID")
+        raise HTTPException(status_code=409, detail="真实企业凭证无需修改额度探测方式")
     return credential, generation
 
 
@@ -217,7 +210,7 @@ def _replace_quota_credential(
             quota_changed=True,
         )
     except Exception as error:
-        logger.error("保存额度企业 ID 失败：凭证=%s，错误=%s", credential_id, type(error).__name__)
+        logger.error("保存额度探测方式失败：凭证=%s，错误=%s", credential_id, type(error).__name__)
         raise HTTPException(status_code=500, detail="保存凭证失败") from error
     if not replaced:
         raise HTTPException(status_code=409, detail="凭证已发生变化，请重试")
@@ -453,17 +446,18 @@ async def manual_admin_credential_checkin(
         ) from error
 
 
-@router.put("/credentials/{credential_id}/quota-enterprise-id")
-async def update_admin_credential_quota_enterprise_id(
+@router.put("/credentials/{credential_id}/quota-probe-mode")
+async def update_admin_credential_quota_probe_mode(
         credential_id: str,
-        request_body: CredentialQuotaEnterpriseIdUpdate,
+        request_body: CredentialQuotaProbeModeUpdate,
         _user: AuthenticatedUser = Depends(require_session_user),
 ):
-    """设置仅用于额度探测的企业 ID，或删除标记并切回个人版探测。"""
+    """切换手动凭证使用个人版或企业版额度接口。"""
     token_manager = get_token_manager_for_user(_user)
     credential, generation = _manual_quota_credential_snapshot(token_manager, credential_id)
-    enterprise_id = request_body.enterprise_id
-    if credential.get("quota_enterprise_id") == enterprise_id:
+    mode = request_body.mode
+    current_mode = credential.get("quota_probe_mode", "personal")
+    if current_mode == mode:
         quota = await credential_quota_manager.probe_credential(
             _user.username,
             token_manager,
@@ -475,62 +469,37 @@ async def update_admin_credential_quota_enterprise_id(
         current_credential, current_generation = current_snapshot
         if (
                 current_generation,
-                current_credential.get("quota_enterprise_id"),
-        ) != (generation, enterprise_id):
+                current_credential.get("quota_probe_mode", "personal"),
+        ) != (generation, mode):
             raise HTTPException(status_code=409, detail="凭证已发生变化，请重试")
         refresh_succeeded = bool(quota and quota.get("status") == "fresh")
-        if enterprise_id is not None and not refresh_succeeded:
-            raise HTTPException(
-                status_code=422,
-                detail="无法探测额度，请检测企业ID是否正确",
-            )
+        if not refresh_succeeded:
+            raise HTTPException(status_code=422, detail="无法使用所选方式探测额度")
         return {
             "credential": _safe_credential_by_id(
                 token_manager, _user.username, credential_id,
             ),
             "quota_refresh_succeeded": refresh_succeeded,
         }
-    if enterprise_id is not None:
-        candidate = credential.copy()
-        candidate["quota_enterprise_id"] = enterprise_id
-        try:
-            quota = await credential_quota_manager.probe_candidate(candidate)
-        except CredentialQuotaProbeError as error:
-            raise HTTPException(
-                status_code=422,
-                detail="无法探测额度，请检测企业ID是否正确",
-            ) from error
-        _replace_quota_credential(
-            token_manager,
-            credential_id,
-            candidate,
-            generation,
-        )
-        credential_quota_manager.invalidate_credential(_user.username, credential_id)
-        credential_quota_manager.publish_probe_result(_user.username, credential_id, quota)
-        return {
-            "credential": _safe_credential_by_id(
-                token_manager, _user.username, credential_id,
-            ),
-            "quota_refresh_succeeded": True,
-        }
-
-    credential.pop("quota_enterprise_id", None)
+    candidate = credential.copy()
+    candidate["quota_probe_mode"] = mode
+    try:
+        quota = await credential_quota_manager.probe_candidate(candidate)
+    except CredentialQuotaProbeError as error:
+        raise HTTPException(status_code=422, detail="无法使用所选方式探测额度") from error
     _replace_quota_credential(
         token_manager,
         credential_id,
-        credential,
+        candidate,
         generation,
     )
     credential_quota_manager.invalidate_credential(_user.username, credential_id)
-    quota = await credential_quota_manager.probe_credential(
-        _user.username,
-        token_manager,
-        credential_id,
-    )
+    credential_quota_manager.publish_probe_result(_user.username, credential_id, quota)
     return {
-        "credential": _safe_credential_by_id(token_manager, _user.username, credential_id),
-        "quota_refresh_succeeded": bool(quota and quota.get("status") == "fresh"),
+        "credential": _safe_credential_by_id(
+            token_manager, _user.username, credential_id,
+        ),
+        "quota_refresh_succeeded": True,
     }
 
 

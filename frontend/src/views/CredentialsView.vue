@@ -19,7 +19,7 @@ import { useClipboard } from '../composables/useClipboard';
 import { useToast } from '../composables/useToast';
 import CredentialActions from '../components/CredentialActions.vue';
 import CredentialAccountSwitcher from '../components/CredentialAccountSwitcher.vue';
-import CredentialQuotaEnterpriseDialog from '../components/CredentialQuotaEnterpriseDialog.vue';
+import CredentialQuotaProbeModeDialog from '../components/CredentialQuotaProbeModeDialog.vue';
 import CredentialQuotaRing from '../components/CredentialQuotaRing.vue';
 import RefreshButton from '../components/RefreshButton.vue';
 import { filterCredentials, type CredentialFilterTab } from '../utils/credentialsFilter';
@@ -50,8 +50,8 @@ const selectingId = ref<string | null>(null);
 const deletingId = ref<string | null>(null);
 const accountSwitcherCredentialId = ref('');
 const accountSwitching = ref(false);
-const quotaEnterpriseCredentialId = ref('');
-const quotaEnterpriseUpdating = ref(false);
+const quotaProbeModeCredentialId = ref('');
+const quotaProbeModeUpdating = ref(false);
 
 const filterTab = ref<CredentialFilterTab>('all');
 const credentialFilterOrder: Record<CredentialFilterTab, number> = {
@@ -69,10 +69,10 @@ const credentialsQuery = useQuery({
 const allCredentials = computed<CredentialRecord[]>(
   () => credentialsQuery.data.value?.credentials || [],
 );
-const quotaEnterpriseCredential = computed(
+const quotaProbeModeCredential = computed(
   () =>
     allCredentials.value.find(
-      (credential) => credential.credential_id === quotaEnterpriseCredentialId.value,
+      (credential) => credential.credential_id === quotaProbeModeCredentialId.value,
     ) || null,
 );
 
@@ -283,9 +283,9 @@ const writeInProgress = computed(
     createMutation.isPending.value ||
     toggleRotationMutation.isPending.value ||
     accountSwitching.value ||
-    quotaEnterpriseUpdating.value ||
+    quotaProbeModeUpdating.value ||
     Boolean(accountSwitcherCredentialId.value) ||
-    Boolean(quotaEnterpriseCredentialId.value),
+    Boolean(quotaProbeModeCredentialId.value),
 );
 
 async function invalidateCredentials() {
@@ -360,21 +360,15 @@ function refreshCredentialQuota(credentialId: string): void {
   refreshQuotaMutation.mutate(credentialId);
 }
 
-function openQuotaEnterpriseDialog(credentialId: string): void {
+function openQuotaProbeModeDialog(credentialId: string): void {
   if (writeInProgress.value || hasActiveTests.value) return;
   const credential = allCredentials.value.find((item) => item.credential_id === credentialId);
-  if (
-    !credential ||
-    credential.is_expired ||
-    credential.auth_source !== 'manual' ||
-    credential.enterprise_id
-  )
-    return;
-  quotaEnterpriseCredentialId.value = credentialId;
+  if (!credential || credential.is_expired || !credential.can_edit_quota_probe_mode) return;
+  quotaProbeModeCredentialId.value = credentialId;
 }
 
-function closeQuotaEnterpriseDialog(): void {
-  if (!quotaEnterpriseUpdating.value) quotaEnterpriseCredentialId.value = '';
+function closeQuotaProbeModeDialog(): void {
+  if (!quotaProbeModeUpdating.value) quotaProbeModeCredentialId.value = '';
 }
 
 function closeAccountSwitcher(): void {
@@ -444,15 +438,17 @@ const columns: Column<CredentialRecord>[] = [
             ? '凭证已过期，无法签到'
             : undefined,
         isRefreshingQuota: refreshingQuotaIds.has(row.credential_id),
-        canEditQuotaEnterpriseId: row.auth_source === 'manual' && !row.enterprise_id,
-        quotaEnterpriseIdDisabledReason: row.is_expired ? '凭证已过期，无法修改企业 ID' : undefined,
+        canEditQuotaProbeMode: row.can_edit_quota_probe_mode === true,
+        quotaProbeModeDisabledReason: row.is_expired
+          ? '凭证已过期，无法修改额度探测方式'
+          : undefined,
         onSelect: selectCredential,
         onTest: testCredential,
         onDelete: deleteCredential,
         onSwitchAccount: openAccountSwitcher,
         onCheckin: checkinCredential,
         onRefreshQuota: refreshCredentialQuota,
-        onEditQuotaEnterpriseId: openQuotaEnterpriseDialog,
+        onEditQuotaProbeMode: openQuotaProbeModeDialog,
       }),
   },
 ];
@@ -605,11 +601,11 @@ const tableRows = computed(() => rows.value as unknown as Record<string, unknown
       @close="closeAccountSwitcher"
       @switching="accountSwitching = $event"
     />
-    <CredentialQuotaEnterpriseDialog
-      :open="Boolean(quotaEnterpriseCredentialId)"
-      :credential="quotaEnterpriseCredential"
-      @close="closeQuotaEnterpriseDialog"
-      @updating="quotaEnterpriseUpdating = $event"
+    <CredentialQuotaProbeModeDialog
+      :open="Boolean(quotaProbeModeCredentialId)"
+      :credential="quotaProbeModeCredential"
+      @close="closeQuotaProbeModeDialog"
+      @updating="quotaProbeModeUpdating = $event"
     />
   </div>
 </template>

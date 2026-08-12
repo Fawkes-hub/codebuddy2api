@@ -10,7 +10,12 @@ import httpx
 
 from config import get_codebuddy_api_endpoint
 from .auth_types import AuthenticatedUser
-from .codebuddy_oauth import CodeBuddyAuthClient, TokenParser, get_codebuddy_accounts_endpoint
+from .codebuddy_oauth import (
+    CodeBuddyAuthClient,
+    TokenParser,
+    get_codebuddy_accounts_endpoint,
+    normalize_credential_auth_source,
+)
 from .codebuddy_token_manager import CodeBuddyTokenManagerRegistry, codebuddy_token_managers
 from .stream_service import get_http_client
 from .users_store import users_store
@@ -299,7 +304,10 @@ class CredentialRefreshManager:
             "upstream_responses": upstream,
             "last_refresh_at": int(self._now_factory()),
         })
-        pending = TokenParser.build_credential_data(refreshed)
+        pending = TokenParser.build_credential_data(
+            refreshed,
+            auth_source=normalize_credential_auth_source(credential.get("auth_source")),
+        )
         self._preserve_compatibility(credential, pending)
         pending["refresh_accounts_pending"] = True
 
@@ -393,7 +401,10 @@ class CredentialRefreshManager:
             "accounts": enabled,
             "upstream_responses": upstream,
         })
-        updated = TokenParser.build_credential_data(completed_data)
+        updated = TokenParser.build_credential_data(
+            completed_data,
+            auth_source=normalize_credential_auth_source(credential.get("auth_source")),
+        )
         self._preserve_compatibility(credential, updated)
 
         from .models_manager import models_manager
@@ -522,7 +533,10 @@ class CredentialRefreshManager:
             "upstream_responses": upstream,
             "last_refresh_at": int(self._now_factory()),
         })
-        updated = TokenParser.build_credential_data(switched)
+        updated = TokenParser.build_credential_data(
+            switched,
+            auth_source=normalize_credential_auth_source(credential.get("auth_source")),
+        )
         if credential.get("compatibility_data") is not None:
             updated["compatibility_data"] = credential["compatibility_data"]
         quota_changed = updated.get("account_id") != credential.get("account_id")

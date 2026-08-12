@@ -54,8 +54,8 @@ describe('管理 API 封装', () => {
     await adminApi.toggleRotation();
     await adminApi.dailyCheckin('cred/id');
     await adminApi.refreshCredentialQuota('cred/id');
-    await adminApi.updateCredentialQuotaEnterpriseId('cred/id', 'enterprise-1');
-    await adminApi.updateCredentialQuotaEnterpriseId('cred/id', null);
+    await adminApi.updateCredentialQuotaProbeMode('cred/id', 'enterprise');
+    await adminApi.updateCredentialQuotaProbeMode('cred/id', 'personal');
     const statsQuery = {
       start_at: 10,
       end_at: 20,
@@ -100,12 +100,12 @@ describe('管理 API 封装', () => {
       ['/api/admin/credentials/cred%2Fid/daily-checkin', { method: 'POST', timeoutMs: 335000 }],
       ['/api/admin/credentials/cred%2Fid/quota/refresh', { method: 'POST', timeoutMs: 35000 }],
       [
-        '/api/admin/credentials/cred%2Fid/quota-enterprise-id',
-        { method: 'PUT', json: { enterprise_id: 'enterprise-1' }, timeoutMs: 35000 },
+        '/api/admin/credentials/cred%2Fid/quota-probe-mode',
+        { method: 'PUT', json: { mode: 'enterprise' }, timeoutMs: 35000 },
       ],
       [
-        '/api/admin/credentials/cred%2Fid/quota-enterprise-id',
-        { method: 'PUT', json: { enterprise_id: null }, timeoutMs: 35000 },
+        '/api/admin/credentials/cred%2Fid/quota-probe-mode',
+        { method: 'PUT', json: { mode: 'personal' }, timeoutMs: 35000 },
       ],
       [
         '/api/admin/stats/overview?start_at=10&end_at=20&timezone=Asia%2FTaipei&traffic=external&model=glm%2F5',

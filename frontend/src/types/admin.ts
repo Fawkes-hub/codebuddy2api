@@ -242,14 +242,15 @@ export interface CredentialRecord {
   scope?: string;
   domain?: string;
   enterprise_id?: string;
-  /** 仅用于额度探测，不属于真实 CodeBuddy 账号上下文。 */
-  quota_enterprise_id?: string;
+  /** 仅用于手动凭证的额度探测，不属于真实 CodeBuddy 账号上下文。 */
+  quota_probe_mode?: CredentialQuotaProbeMode;
   enterprise_name?: string;
   department_full_name?: string;
   account_type?: string;
   account_id?: string;
   account_count?: number;
-  auth_source?: 'oauth' | 'manual';
+  auth_source?: 'oauth' | 'manual' | 'unknown';
+  can_edit_quota_probe_mode?: boolean;
   has_refresh_token: boolean;
   has_token: boolean;
   token_display: string;
@@ -267,6 +268,7 @@ export interface CredentialDailyCheckin {
 }
 
 export type CredentialQuotaStatus = 'unknown' | 'fresh' | 'stale' | 'error';
+export type CredentialQuotaProbeMode = 'personal' | 'enterprise';
 
 export interface CredentialQuotaPackage {
   name: string;
@@ -313,7 +315,7 @@ export interface CredentialsResponse {
   current: CurrentCredential;
 }
 
-export interface CredentialQuotaEnterpriseIdUpdateResponse {
+export interface CredentialQuotaProbeModeUpdateResponse {
   credential: CredentialRecord;
   quota_refresh_succeeded: boolean;
 }

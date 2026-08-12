@@ -11,7 +11,7 @@ from src.admin_router import (
     AdminSettingsUpdate,
     ApiKeyCreateRequest,
     CredentialCreateRequest,
-    CredentialQuotaEnterpriseIdUpdate,
+    CredentialQuotaProbeModeUpdate,
     CredentialTestRequest,
     _request_base_url,
     _safe_credential,
@@ -37,7 +37,7 @@ from src.admin_router import (
     test_admin_credential,
     test_admin_credential_route,
     toggle_admin_auto_rotation,
-    update_admin_credential_quota_enterprise_id,
+    update_admin_credential_quota_probe_mode,
 )
 from src.auth_types import AuthenticatedUser
 from src.codebuddy_token_manager import CodeBuddyTokenManagerRegistry
@@ -158,6 +158,61 @@ class AdminApiTests(TempConfigMixin, unittest.IsolatedAsyncioTestCase):
         self.assertTrue(deleted["deleted"])
         self.assertEqual((await list_admin_credentials(self.user))["credentials"], [])
 
+    async def test_admin_credentials_expose_source_and_quota_mode_capability_conservatively(self):
+        manager = self._manager()
+        cases = (
+            ("manual.json", "manual", None, True),
+            ("oauth.json", "oauth", None, False),
+            ("unknown.json", None, None, False),
+            ("enterprise.json", "manual", "real-enterprise", False),
+        )
+        for filename, source, enterprise_id, _expected in cases:
+            extra = {}
+            if source is not None:
+                extra["auth_source"] = source
+            if enterprise_id is not None:
+                extra["enterprise_id"] = enterprise_id
+            self.assertTrue(self._add_credential(
+                manager,
+                f"token-{filename}",
+                filename,
+                filename,
+                **extra,
+            ))
+
+        with mock.patch("src.admin_router.get_token_manager_for_user", return_value=manager):
+            listed = await list_admin_credentials(self.user)
+
+        by_filename = {item["filename"]: item for item in listed["credentials"]}
+        for filename, source, _enterprise_id, expected in cases:
+            expected_source = source or "unknown"
+            self.assertEqual(by_filename[filename]["auth_source"], expected_source)
+            self.assertIs(by_filename[filename]["can_edit_quota_probe_mode"], expected)
+
+    async def test_quota_probe_mode_rejects_credential_without_explicit_manual_source(self):
+        manager = self._manager()
+        self.assertTrue(self._add_credential(manager, "token", "legacy", "legacy.json"))
+        credential_id = manager.get_credentials_info()[0]["credential_id"]
+
+        with (
+            mock.patch("src.admin_router.get_token_manager_for_user", return_value=manager),
+            mock.patch.object(
+                credential_quota_manager,
+                "probe_candidate",
+                new=mock.AsyncMock(return_value={"status": "fresh"}),
+            ) as probe,
+        ):
+            with self.assertRaises(HTTPException) as raised:
+                await update_admin_credential_quota_probe_mode(
+                    credential_id,
+                    CredentialQuotaProbeModeUpdate(mode="enterprise"),
+                    self.user,
+                )
+
+        self.assertEqual(raised.exception.status_code, 409)
+        self.assertEqual(raised.exception.detail, "仅明确手动添加的凭证可修改额度探测方式")
+        probe.assert_not_awaited()
+
     async def test_admin_credentials_include_only_safe_quota_snapshot(self):
         manager = self._manager()
         self.assertTrue(self._add_credential(manager, "token", "user", "quota.json"))
@@ -248,9 +303,11 @@ class AdminApiTests(TempConfigMixin, unittest.IsolatedAsyncioTestCase):
                         await manual_admin_credential_checkin(credential_id, self.user)
                 self.assertEqual(raised.exception.status_code, status_code)
 
-    async def test_manual_credential_enterprise_quota_marker_probes_before_atomic_save(self):
+    async def test_manual_credential_quota_probe_mode_probes_before_atomic_save(self):
         manager = self._manager()
-        self.assertTrue(self._add_credential(manager, "token", "user", "manual.json"))
+        self.assertTrue(self._add_credential(
+            manager, "token", "user", "manual.json", auth_source="manual",
+        ))
         credential_id = manager.get_credentials_info()[0]["credential_id"]
         quota = {
             "status": "fresh",
@@ -270,10 +327,10 @@ class AdminApiTests(TempConfigMixin, unittest.IsolatedAsyncioTestCase):
 
         async def probe_before_save(candidate):
             self.assertNotIn(
-                "quota_enterprise_id",
+                "quota_probe_mode",
                 manager.get_credential_by_id(credential_id),
             )
-            self.assertEqual(candidate["quota_enterprise_id"], "enterprise-1")
+            self.assertEqual(candidate["quota_probe_mode"], "enterprise")
             return quota
 
         with (
@@ -287,9 +344,9 @@ class AdminApiTests(TempConfigMixin, unittest.IsolatedAsyncioTestCase):
             mock.patch.object(credential_quota_manager, "publish_probe_result") as publish,
             mock.patch.object(credential_quota_manager, "get_quota", return_value=quota),
         ):
-            result = await update_admin_credential_quota_enterprise_id(
+            result = await update_admin_credential_quota_probe_mode(
                 credential_id,
-                CredentialQuotaEnterpriseIdUpdate(enterprise_id=" enterprise-1 "),
+                CredentialQuotaProbeModeUpdate(mode="enterprise"),
                 self.user,
             )
 
@@ -297,14 +354,16 @@ class AdminApiTests(TempConfigMixin, unittest.IsolatedAsyncioTestCase):
         invalidate.assert_called_once_with("admin", credential_id)
         publish.assert_called_once_with("admin", credential_id, quota)
         stored = manager.get_credential_by_id(credential_id)
-        self.assertEqual(stored["quota_enterprise_id"], "enterprise-1")
+        self.assertEqual(stored["quota_probe_mode"], "enterprise")
         self.assertNotIn("enterprise_id", stored)
-        self.assertEqual(result["credential"]["quota_enterprise_id"], "enterprise-1")
+        self.assertEqual(result["credential"]["quota_probe_mode"], "enterprise")
         self.assertTrue(result["quota_refresh_succeeded"])
 
-    async def test_enterprise_quota_marker_probe_failure_leaves_credential_unchanged(self):
+    async def test_quota_probe_mode_failure_leaves_credential_unchanged(self):
         manager = self._manager()
-        self.assertTrue(self._add_credential(manager, "token", "user", "manual.json"))
+        self.assertTrue(self._add_credential(
+            manager, "token", "user", "manual.json", auth_source="manual",
+        ))
         credential_id = manager.get_credentials_info()[0]["credential_id"]
         before = manager.snapshot_credential_by_id(credential_id)
 
@@ -319,26 +378,27 @@ class AdminApiTests(TempConfigMixin, unittest.IsolatedAsyncioTestCase):
             mock.patch.object(credential_quota_manager, "publish_probe_result") as publish,
         ):
             with self.assertRaises(HTTPException) as raised:
-                await update_admin_credential_quota_enterprise_id(
+                await update_admin_credential_quota_probe_mode(
                     credential_id,
-                    CredentialQuotaEnterpriseIdUpdate(enterprise_id="wrong-enterprise"),
+                    CredentialQuotaProbeModeUpdate(mode="enterprise"),
                     self.user,
                 )
 
         self.assertEqual(raised.exception.status_code, 422)
-        self.assertEqual(raised.exception.detail, "无法探测额度，请检测企业ID是否正确")
+        self.assertEqual(raised.exception.detail, "无法使用所选方式探测额度")
         self.assertEqual(manager.snapshot_credential_by_id(credential_id), before)
         invalidate.assert_not_called()
         publish.assert_not_called()
 
-    async def test_repeating_same_enterprise_quota_marker_only_refreshes_quota(self):
+    async def test_repeating_same_quota_probe_mode_only_refreshes_quota(self):
         manager = self._manager()
         self.assertTrue(self._add_credential(
             manager,
             "token",
             "user",
             "manual.json",
-            quota_enterprise_id="enterprise-1",
+            auth_source="manual",
+            quota_probe_mode="enterprise",
         ))
         credential_id = manager.get_credentials_info()[0]["credential_id"]
         quota_manager = CredentialQuotaManager(
@@ -369,9 +429,9 @@ class AdminApiTests(TempConfigMixin, unittest.IsolatedAsyncioTestCase):
                 wraps=manager.replace_credential_by_id,
             ) as replace,
         ):
-            result = await update_admin_credential_quota_enterprise_id(
+            result = await update_admin_credential_quota_probe_mode(
                 credential_id,
-                CredentialQuotaEnterpriseIdUpdate(enterprise_id=" enterprise-1 "),
+                CredentialQuotaProbeModeUpdate(mode="enterprise"),
                 self.user,
             )
 
@@ -393,14 +453,15 @@ class AdminApiTests(TempConfigMixin, unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(quota_manager.get_quota("admin", credential_id)["remaining"], 75)
 
-    async def test_repeating_quota_marker_rejects_change_during_refresh(self):
+    async def test_repeating_quota_probe_mode_rejects_change_during_refresh(self):
         manager = self._manager()
         self.assertTrue(self._add_credential(
             manager,
             "token",
             "user",
             "manual.json",
-            quota_enterprise_id="enterprise-1",
+            auth_source="manual",
+            quota_probe_mode="enterprise",
         ))
         credential_id = manager.get_credentials_info()[0]["credential_id"]
         initial_generation = manager.snapshot_credential_by_id(credential_id)[1]
@@ -411,7 +472,7 @@ class AdminApiTests(TempConfigMixin, unittest.IsolatedAsyncioTestCase):
             self.assertIs(selected_manager, manager)
             self.assertEqual(selected_id, credential_id)
             current, generation = manager.snapshot_credential_by_id(credential_id)
-            current["quota_enterprise_id"] = "enterprise-2"
+            current["quota_probe_mode"] = "personal"
             self.assertTrue(manager.replace_credential_by_id(
                 credential_id,
                 current,
@@ -429,30 +490,31 @@ class AdminApiTests(TempConfigMixin, unittest.IsolatedAsyncioTestCase):
             ),
         ):
             with self.assertRaises(HTTPException) as raised:
-                await update_admin_credential_quota_enterprise_id(
+                await update_admin_credential_quota_probe_mode(
                     credential_id,
-                    CredentialQuotaEnterpriseIdUpdate(enterprise_id="enterprise-1"),
+                    CredentialQuotaProbeModeUpdate(mode="enterprise"),
                     self.user,
                 )
 
         self.assertEqual(raised.exception.status_code, 409)
         self.assertEqual(raised.exception.detail, "凭证已发生变化，请重试")
         stored, generation = manager.snapshot_credential_by_id(credential_id)
-        self.assertEqual(stored["quota_enterprise_id"], "enterprise-2")
+        self.assertEqual(stored["quota_probe_mode"], "personal")
         self.assertEqual(generation, initial_generation + 1)
         self.assertEqual(
             manager.get_quota_generation_by_id(credential_id),
             initial_quota_generation + 1,
         )
 
-    async def test_repeating_quota_marker_rejects_deletion_during_refresh(self):
+    async def test_repeating_quota_probe_mode_rejects_deletion_during_refresh(self):
         manager = self._manager()
         self.assertTrue(self._add_credential(
             manager,
             "token",
             "user",
             "manual.json",
-            quota_enterprise_id="enterprise-1",
+            auth_source="manual",
+            quota_probe_mode="enterprise",
         ))
         credential_id = manager.get_credentials_info()[0]["credential_id"]
 
@@ -469,23 +531,24 @@ class AdminApiTests(TempConfigMixin, unittest.IsolatedAsyncioTestCase):
             ),
         ):
             with self.assertRaises(HTTPException) as raised:
-                await update_admin_credential_quota_enterprise_id(
+                await update_admin_credential_quota_probe_mode(
                     credential_id,
-                    CredentialQuotaEnterpriseIdUpdate(enterprise_id="enterprise-1"),
+                    CredentialQuotaProbeModeUpdate(mode="enterprise"),
                     self.user,
                 )
 
         self.assertEqual(raised.exception.status_code, 409)
         self.assertEqual(raised.exception.detail, "凭证已发生变化，请重试")
 
-    async def test_repeating_same_enterprise_quota_marker_requires_successful_refresh(self):
+    async def test_repeating_same_quota_probe_mode_requires_successful_refresh(self):
         manager = self._manager()
         self.assertTrue(self._add_credential(
             manager,
             "token",
             "user",
             "manual.json",
-            quota_enterprise_id="enterprise-1",
+            auth_source="manual",
+            quota_probe_mode="enterprise",
         ))
         credential_id = manager.get_credentials_info()[0]["credential_id"]
         generation = manager.snapshot_credential_by_id(credential_id)[1]
@@ -506,22 +569,24 @@ class AdminApiTests(TempConfigMixin, unittest.IsolatedAsyncioTestCase):
             mock.patch.object(manager, "replace_credential_by_id") as replace,
         ):
             with self.assertRaises(HTTPException) as raised:
-                await update_admin_credential_quota_enterprise_id(
+                await update_admin_credential_quota_probe_mode(
                     credential_id,
-                    CredentialQuotaEnterpriseIdUpdate(enterprise_id="enterprise-1"),
+                    CredentialQuotaProbeModeUpdate(mode="enterprise"),
                     self.user,
                 )
 
         self.assertEqual(raised.exception.status_code, 422)
-        self.assertEqual(raised.exception.detail, "无法探测额度，请检测企业ID是否正确")
+        self.assertEqual(raised.exception.detail, "无法使用所选方式探测额度")
         candidate_probe.assert_not_awaited()
         replace.assert_not_called()
         self.assertEqual(manager.snapshot_credential_by_id(credential_id)[1], generation)
         self.assertEqual(manager.get_quota_generation_by_id(credential_id), quota_generation)
 
-    async def test_repeating_absent_enterprise_quota_marker_only_refreshes_personal_quota(self):
+    async def test_repeating_default_personal_quota_probe_mode_only_refreshes_quota(self):
         manager = self._manager()
-        self.assertTrue(self._add_credential(manager, "token", "user", "manual.json"))
+        self.assertTrue(self._add_credential(
+            manager, "token", "user", "manual.json", auth_source="manual",
+        ))
         credential_id = manager.get_credentials_info()[0]["credential_id"]
         quota_manager = CredentialQuotaManager(
             registry=self.registry,
@@ -546,9 +611,9 @@ class AdminApiTests(TempConfigMixin, unittest.IsolatedAsyncioTestCase):
                 wraps=manager.replace_credential_by_id,
             ) as replace,
         ):
-            result = await update_admin_credential_quota_enterprise_id(
+            result = await update_admin_credential_quota_probe_mode(
                 credential_id,
-                CredentialQuotaEnterpriseIdUpdate(enterprise_id=None),
+                CredentialQuotaProbeModeUpdate(mode="personal"),
                 self.user,
             )
 
@@ -569,47 +634,53 @@ class AdminApiTests(TempConfigMixin, unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(quota_manager.get_quota("admin", credential_id)["remaining"], 75)
 
-    async def test_removing_enterprise_quota_marker_commits_before_personal_refresh(self):
+    async def test_switching_quota_probe_mode_probes_before_atomic_save(self):
         manager = self._manager()
         self.assertTrue(self._add_credential(
             manager,
             "token",
             "user",
             "manual.json",
-            quota_enterprise_id="enterprise-1",
+            auth_source="manual",
+            quota_probe_mode="enterprise",
         ))
         credential_id = manager.get_credentials_info()[0]["credential_id"]
-        failed_quota = {"status": "error", "quota_type": "personal"}
+        quota = {"status": "fresh", "quota_type": "personal"}
 
-        async def refresh_after_delete(username, selected_manager, selected_id):
-            self.assertEqual(username, "admin")
-            self.assertIs(selected_manager, manager)
-            self.assertEqual(selected_id, credential_id)
-            self.assertNotIn("quota_enterprise_id", manager.get_credential_by_id(credential_id))
-            return failed_quota
+        async def probe_before_save(candidate):
+            self.assertEqual(
+                manager.get_credential_by_id(credential_id)["quota_probe_mode"],
+                "enterprise",
+            )
+            self.assertEqual(candidate["quota_probe_mode"], "personal")
+            return quota
 
         with (
             mock.patch("src.admin_router.get_token_manager_for_user", return_value=manager),
-            mock.patch.object(credential_quota_manager, "invalidate_credential") as invalidate,
             mock.patch.object(
                 credential_quota_manager,
-                "probe_credential",
-                new=mock.AsyncMock(side_effect=refresh_after_delete),
-            ) as refresh,
-            mock.patch.object(credential_quota_manager, "get_quota", return_value=failed_quota),
+                "probe_candidate",
+                new=mock.AsyncMock(side_effect=probe_before_save),
+            ) as probe,
+            mock.patch.object(credential_quota_manager, "invalidate_credential") as invalidate,
+            mock.patch.object(credential_quota_manager, "publish_probe_result") as publish,
         ):
-            result = await update_admin_credential_quota_enterprise_id(
+            result = await update_admin_credential_quota_probe_mode(
                 credential_id,
-                CredentialQuotaEnterpriseIdUpdate(enterprise_id=None),
+                CredentialQuotaProbeModeUpdate(mode="personal"),
                 self.user,
             )
 
+        probe.assert_awaited_once()
         invalidate.assert_called_once_with("admin", credential_id)
-        refresh.assert_awaited_once()
-        self.assertNotIn("quota_enterprise_id", manager.get_credential_by_id(credential_id))
-        self.assertFalse(result["quota_refresh_succeeded"])
+        publish.assert_called_once_with("admin", credential_id, quota)
+        self.assertEqual(
+            manager.get_credential_by_id(credential_id)["quota_probe_mode"],
+            "personal",
+        )
+        self.assertTrue(result["quota_refresh_succeeded"])
 
-    async def test_enterprise_quota_marker_rejects_ineligible_and_concurrent_credentials(self):
+    async def test_quota_probe_mode_rejects_ineligible_and_concurrent_credentials(self):
         manager = self._manager()
         self.assertTrue(self._add_credential(
             manager,
@@ -623,6 +694,7 @@ class AdminApiTests(TempConfigMixin, unittest.IsolatedAsyncioTestCase):
             "enterprise-token",
             "enterprise-user",
             "enterprise.json",
+            auth_source="manual",
             enterprise_id="real-enterprise",
         ))
         self.assertTrue(self._add_credential(
@@ -630,6 +702,7 @@ class AdminApiTests(TempConfigMixin, unittest.IsolatedAsyncioTestCase):
             "expired-token",
             "expired-user",
             "expired.json",
+            auth_source="manual",
             expires_at=1,
         ))
         ids = {item["filename"]: item["credential_id"] for item in manager.get_credentials_info()}
@@ -641,22 +714,24 @@ class AdminApiTests(TempConfigMixin, unittest.IsolatedAsyncioTestCase):
                 ids["expired.json"],
             ):
                 with self.subTest(credential_id=credential_id), self.assertRaises(HTTPException) as raised:
-                    await update_admin_credential_quota_enterprise_id(
+                    await update_admin_credential_quota_probe_mode(
                         credential_id,
-                        CredentialQuotaEnterpriseIdUpdate(enterprise_id="enterprise-1"),
+                        CredentialQuotaProbeModeUpdate(mode="enterprise"),
                         self.user,
                     )
                 self.assertEqual(raised.exception.status_code, 409)
 
             with self.assertRaises(HTTPException) as missing:
-                await update_admin_credential_quota_enterprise_id(
+                await update_admin_credential_quota_probe_mode(
                     "missing",
-                    CredentialQuotaEnterpriseIdUpdate(enterprise_id="enterprise-1"),
+                    CredentialQuotaProbeModeUpdate(mode="enterprise"),
                     self.user,
                 )
         self.assertEqual(missing.exception.status_code, 404)
 
-        manual = self._add_credential(manager, "manual", "manual", "manual.json")
+        manual = self._add_credential(
+            manager, "manual", "manual", "manual.json", auth_source="manual",
+        )
         self.assertTrue(manual)
         manual_id = ids.get("manual.json") or next(
             item["credential_id"]
@@ -673,16 +748,18 @@ class AdminApiTests(TempConfigMixin, unittest.IsolatedAsyncioTestCase):
             mock.patch.object(manager, "replace_credential_by_id", return_value=False),
         ):
             with self.assertRaises(HTTPException) as conflict:
-                await update_admin_credential_quota_enterprise_id(
+                await update_admin_credential_quota_probe_mode(
                     manual_id,
-                    CredentialQuotaEnterpriseIdUpdate(enterprise_id="enterprise-1"),
+                    CredentialQuotaProbeModeUpdate(mode="enterprise"),
                     self.user,
                 )
         self.assertEqual(conflict.exception.status_code, 409)
 
-    async def test_enterprise_quota_marker_maps_persistence_failure(self):
+    async def test_quota_probe_mode_maps_persistence_failure(self):
         manager = self._manager()
-        self.assertTrue(self._add_credential(manager, "token", "user", "manual.json"))
+        self.assertTrue(self._add_credential(
+            manager, "token", "user", "manual.json", auth_source="manual",
+        ))
         credential_id = manager.get_credentials_info()[0]["credential_id"]
         with (
             mock.patch("src.admin_router.get_token_manager_for_user", return_value=manager),
@@ -698,9 +775,9 @@ class AdminApiTests(TempConfigMixin, unittest.IsolatedAsyncioTestCase):
             ),
         ):
             with self.assertRaises(HTTPException) as raised:
-                await update_admin_credential_quota_enterprise_id(
+                await update_admin_credential_quota_probe_mode(
                     credential_id,
-                    CredentialQuotaEnterpriseIdUpdate(enterprise_id="enterprise-1"),
+                    CredentialQuotaProbeModeUpdate(mode="enterprise"),
                     self.user,
                 )
         self.assertEqual(raised.exception.status_code, 500)
@@ -921,17 +998,14 @@ class AdminApiTests(TempConfigMixin, unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValidationError):
             CredentialCreateRequest(bearer_token="token", user_id="legacy-user")
 
-    def test_quota_enterprise_id_update_validates_header_safe_optional_text(self):
-        self.assertEqual(
-            CredentialQuotaEnterpriseIdUpdate(enterprise_id=" enterprise-1 ").enterprise_id,
-            "enterprise-1",
-        )
-        self.assertIsNone(CredentialQuotaEnterpriseIdUpdate(enterprise_id=None).enterprise_id)
-        for enterprise_id in ("", " ", "bad\nvalue", "非-ascii", "x" * 257):
-            with self.subTest(enterprise_id=enterprise_id), self.assertRaises(ValidationError):
-                CredentialQuotaEnterpriseIdUpdate(enterprise_id=enterprise_id)
+    def test_quota_probe_mode_update_accepts_only_known_modes(self):
+        self.assertEqual(CredentialQuotaProbeModeUpdate(mode="personal").mode, "personal")
+        self.assertEqual(CredentialQuotaProbeModeUpdate(mode="enterprise").mode, "enterprise")
+        for mode in ("", "other", None):
+            with self.subTest(mode=mode), self.assertRaises(ValidationError):
+                CredentialQuotaProbeModeUpdate(mode=mode)
         with self.assertRaises(ValidationError):
-            CredentialQuotaEnterpriseIdUpdate(enterprise_id="valid", unknown=True)
+            CredentialQuotaProbeModeUpdate(mode="personal", unknown=True)
 
     async def test_create_admin_credential_always_uses_random_suffix(self):
         manager = self._manager()
@@ -1075,7 +1149,7 @@ class AdminApiTests(TempConfigMixin, unittest.IsolatedAsyncioTestCase):
             "target-token",
             "target-user",
             "target",
-            quota_enterprise_id="quota-only-enterprise",
+            quota_probe_mode="enterprise",
         ))
         credential_id = manager.get_credentials_info()[0]["credential_id"]
         config.update_settings(

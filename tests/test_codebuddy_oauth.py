@@ -587,13 +587,16 @@ class CodeBuddyAuthClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(TokenParser._normalize_account("invalid"))
         self.assertIsNone(TokenParser._normalize_account({"uid": ""}))
 
-        credential = TokenParser.build_credential_data({
-            "bearer_token": "opaque-token",
-            "accounts": [None, {"uid": "account", "type": "personal"}],
-            "full_response": {"legacy": True},
-            "refresh_expires_in": 100,
-            "created_at": 1000,
-        })
+        credential = TokenParser.build_credential_data(
+            {
+                "bearer_token": "opaque-token",
+                "accounts": [None, {"uid": "account", "type": "personal"}],
+                "full_response": {"legacy": True},
+                "refresh_expires_in": 100,
+                "created_at": 1000,
+            },
+            auth_source="oauth",
+        )
         self.assertEqual(credential["compatibility_data"], {
             "legacy_full_response": {"legacy": True},
         })
@@ -888,6 +891,28 @@ class CodeBuddyAuthRouterTests(unittest.IsolatedAsyncioTestCase):
                 self.assertNotIn("sensitive-upstream", json.dumps(body))
 
 class TokenParserTests(unittest.TestCase):
+    def test_build_credential_data_uses_explicit_source_instead_of_payload_shape(self):
+        self.assertEqual(oauth.normalize_credential_auth_source(None), "unknown")
+        self.assertEqual(oauth.normalize_credential_auth_source([]), "unknown")
+        oauth_payload = {
+            "bearer_token": "oauth-token",
+            "upstream_responses": {"login_token": {"code": 0}},
+        }
+        manual = TokenParser.build_credential_data(oauth_payload, auth_source="manual")
+        unknown = TokenParser.build_credential_data(
+            {"bearer_token": "legacy-token"},
+            auth_source="unknown",
+        )
+
+        self.assertEqual(manual["auth_source"], "manual")
+        self.assertNotIn("auth_platform", manual)
+        self.assertEqual(unknown["auth_source"], "unknown")
+        with self.assertRaisesRegex(ValueError, "invalid credential auth source"):
+            TokenParser.build_credential_data(
+                {"bearer_token": "invalid-source"},
+                auth_source="invalid",
+            )
+
     def test_successful_jwt_parse_does_not_log_personal_information(self):
         token = jwt_with_payload({
             "sub": "private-user-id",
@@ -918,13 +943,16 @@ class TokenParserTests(unittest.TestCase):
         })
 
         with mock.patch("src.codebuddy_oauth.time.time", return_value=123):
-            data = TokenParser.build_credential_data({
-                "access_token": token,
-                "expires_in": 3600,
-                "refresh_token": "refresh",
-                "token_type": "Bearer",
-                "scope": "openid",
-            })
+            data = TokenParser.build_credential_data(
+                {
+                    "access_token": token,
+                    "expires_in": 3600,
+                    "refresh_token": "refresh",
+                    "token_type": "Bearer",
+                    "scope": "openid",
+                },
+                auth_source="oauth",
+            )
 
         self.assertEqual(data["bearer_token"], token)
         self.assertEqual(data["user_id"], "sub-id")
@@ -947,11 +975,14 @@ class TokenParserTests(unittest.TestCase):
             "iss": "https://issuer.example.com/auth/sso-derived",
         })
 
-        data = TokenParser.build_credential_data({
-            "bearer_token": token,
-            "domain": "configured.example.com",
-            "enterprise_id": "configured-enterprise",
-        })
+        data = TokenParser.build_credential_data(
+            {
+                "bearer_token": token,
+                "domain": "configured.example.com",
+                "enterprise_id": "configured-enterprise",
+            },
+            auth_source="manual",
+        )
 
         self.assertEqual(data["domain"], "configured.example.com")
         self.assertEqual(data["enterprise_id"], "configured-enterprise")
@@ -965,15 +996,18 @@ class TokenParserTests(unittest.TestCase):
             "iss": "https://issuer.example.com/auth/sso-derived-enterprise",
         })
 
-        data = TokenParser.build_credential_data({
-            "bearer_token": token,
-            "enterprise_id": "stale-enterprise",
-            "account": {
-                "uid": "personal-uid",
-                "type": "personal",
-                "pluginEnabled": True,
+        data = TokenParser.build_credential_data(
+            {
+                "bearer_token": token,
+                "enterprise_id": "stale-enterprise",
+                "account": {
+                    "uid": "personal-uid",
+                    "type": "personal",
+                    "pluginEnabled": True,
+                },
             },
-        })
+            auth_source="oauth",
+        )
 
         self.assertNotIn("enterprise_id", data)
         self.assertNotIn("enterprise_id", data["user_info"])
@@ -981,10 +1015,13 @@ class TokenParserTests(unittest.TestCase):
 
     def test_build_credential_data_falls_back_to_stable_anonymous_id_for_invalid_token(self):
         token = "plain-token-12345678"
-        data = TokenParser.build_credential_data({
-            "bearer_token": token,
-            "domain": "www.codebuddy.cn",
-        })
+        data = TokenParser.build_credential_data(
+            {
+                "bearer_token": token,
+                "domain": "www.codebuddy.cn",
+            },
+            auth_source="manual",
+        )
 
         self.assertEqual(data["user_id"], "anonymous_12345678")
         self.assertEqual(data["domain"], "www.codebuddy.cn")
@@ -992,11 +1029,14 @@ class TokenParserTests(unittest.TestCase):
 
     def test_build_credential_data_omits_none_values(self):
         token = "plain-token-abcdefgh"
-        data = TokenParser.build_credential_data({
-            "access_token": token,
-            "refresh_token": None,
-            "scope": None,
-        })
+        data = TokenParser.build_credential_data(
+            {
+                "access_token": token,
+                "refresh_token": None,
+                "scope": None,
+            },
+            auth_source="manual",
+        )
 
         self.assertNotIn("refresh_token", data)
         self.assertNotIn("scope", data)
@@ -1078,7 +1118,7 @@ class CodeBuddyTokenSaverTests(unittest.IsolatedAsyncioTestCase):
             mock.patch(
                 "src.codebuddy_oauth.TokenParser.build_credential_data",
                 return_value=credential_data,
-            ),
+            ) as build_credential,
             mock.patch(
                 "src.codebuddy_token_manager.get_token_manager_for_user",
                 return_value=manager,
@@ -1092,6 +1132,10 @@ class CodeBuddyTokenSaverTests(unittest.IsolatedAsyncioTestCase):
             result = await CodeBuddyTokenSaver().save({"access_token": "token"}, self.user)
 
         self.assertTrue(result)
+        build_credential.assert_called_once_with(
+            {"access_token": "token"},
+            auth_source="oauth",
+        )
         manager.add_credential_with_data.assert_called_once_with(
             credential_data=credential_data,
             filename="alice.json",

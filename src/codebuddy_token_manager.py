@@ -63,13 +63,18 @@ class CodeBuddyTokenManager:
         """加载所有 token 文件。"""
         current_filename = self._credential_filename(self.current_index)
         self.credentials = self.store.load_credentials()
-        from .codebuddy_oauth import TokenParser
+        from .codebuddy_oauth import TokenParser, normalize_credential_auth_source
 
         for record in self.credentials:
             data = record["data"]
+            auth_source = normalize_credential_auth_source(data.get("auth_source"))
             if data.get("credential_schema_version") == 2 and data.get("user_id"):
+                data["auth_source"] = auth_source
                 continue
-            normalized = TokenParser.build_credential_data(data)
+            normalized = TokenParser.build_credential_data(
+                data,
+                auth_source=auth_source,
+            )
             compatibility = normalized.setdefault("compatibility_data", {})
             if "full_response" in data:
                 compatibility["legacy_full_response"] = data["full_response"]
@@ -226,6 +231,8 @@ class CodeBuddyTokenManager:
 
     def get_credentials_info(self) -> List[Dict]:
         """获取所有凭证的详细信息，包括过期状态。"""
+        from .codebuddy_oauth import normalize_credential_auth_source
+
         credentials_info = []
         for index, cred in enumerate(self.credentials):
             data = cred["data"]
@@ -261,13 +268,13 @@ class CodeBuddyTokenManager:
                     "scope": data.get("scope"),
                     "domain": data.get("domain"),
                     "enterprise_id": data.get("enterprise_id"),
-                    "quota_enterprise_id": data.get("quota_enterprise_id"),
+                    "quota_probe_mode": data.get("quota_probe_mode"),
                     "enterprise_name": data.get("enterprise_name"),
                     "department_full_name": data.get("department_full_name"),
                     "account_type": data.get("account_type"),
                     "account_id": data.get("account_id"),
                     "account_count": len(data.get("accounts") or []),
-                    "auth_source": data.get("auth_source", "manual"),
+                    "auth_source": normalize_credential_auth_source(data.get("auth_source")),
                     "has_refresh_token": bool(data.get("refresh_token")),
                     "session_state": data.get("session_state"),
                 }
@@ -356,7 +363,10 @@ class CodeBuddyTokenManager:
 
         from .codebuddy_oauth import TokenParser
 
-        credential_data = TokenParser.build_credential_data({"bearer_token": bearer_token})
+        credential_data = TokenParser.build_credential_data(
+            {"bearer_token": bearer_token},
+            auth_source="manual",
+        )
         return self.add_credential_with_data(
             credential_data,
             filename,

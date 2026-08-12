@@ -127,7 +127,7 @@ class ModelsManagerTests(ConfigIsolationMixin, unittest.IsolatedAsyncioTestCase)
             {
                 "bearer_token": "international-token",
                 "user_id": "user-id",
-                "quota_enterprise_id": "quota-only-enterprise",
+                "quota_probe_mode": "enterprise",
             },
         )
 
