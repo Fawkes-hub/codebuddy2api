@@ -23,7 +23,7 @@ copilot.tencent.com (CodeBuddy 中国站账户)
 ## 命令行启动（推荐）
 
 ```bash
-cd /path/to/codebuddy2api
+# 请先进入 codebuddy2api 项目目录
 
 # 首次运行：创建虚拟环境并安装依赖
 python3 -m venv venv
@@ -52,7 +52,7 @@ curl http://127.0.0.1:8001/openai/v1/models \
 ## 可选 Docker Compose 部署
 
 ```bash
-cd /path/to/codebuddy2api
+# 请先进入 codebuddy2api 项目目录
 
 docker compose up -d
 docker compose ps
