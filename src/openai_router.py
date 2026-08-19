@@ -4,6 +4,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
+from fastapi.responses import StreamingResponse
 
 from .auth_router import require_api_key_user, require_session_user
 from .auth_types import AuthenticatedUser
@@ -11,8 +12,16 @@ from .codebuddy_api_client import codebuddy_api_client
 from .codebuddy_token_manager import get_token_manager_for_user
 from .models_manager import models_manager
 from .private_response import PrivateNoStoreRoute
+from .responses_adapter import (
+    ResponsesAdapterError,
+    chat_sse_to_responses,
+    chat_to_response,
+    new_response_id,
+    responses_to_chat,
+)
 from .request_processor import RequestProcessor
 from .stream_service import CodeBuddyStreamService
+from .sse import SSE_HEADERS
 from .usage_stats_context import UsageStatsContext, create_usage_stats_context
 
 logger = logging.getLogger(__name__)
@@ -80,6 +89,31 @@ CHAT_COMPLETIONS_OPENAPI_REQUEST_BODY = {
     },
 }
 
+RESPONSES_OPENAPI_REQUEST_BODY = {
+    "required": True,
+    "content": {
+        "application/json": {
+            "schema": {
+                "type": "object",
+                "required": ["input"],
+                "additionalProperties": True,
+                "properties": {
+                    "model": {"type": "string"},
+                    "input": {},
+                    "instructions": {"type": "string"},
+                    "stream": {"type": "boolean", "default": False},
+                    "tools": {"type": "array", "items": {"type": "object"}},
+                    "tool_choice": {"anyOf": [{"type": "string"}, {"type": "object"}]},
+                    "max_output_tokens": {"type": "integer"},
+                    "temperature": {"type": "number"},
+                    "top_p": {"type": "number"},
+                    "reasoning": {"type": "object"},
+                },
+            }
+        }
+    },
+}
+
 
 async def get_available_models_list(user: AuthenticatedUser) -> List[str]:
     """动态加载可用模型列表，支持设置热更新和真实模型回退缓存。"""
@@ -122,8 +156,8 @@ class CredentialManager:
             raise HTTPException(status_code=401, detail="凭证获取失败") from error
 
 
-async def chat_completions(
-        request: Request,
+async def _execute_chat_request(
+        request_body: Dict[str, Any],
         _user: AuthenticatedUser,
         x_conversation_id: Optional[str] = None,
         x_conversation_request_id: Optional[str] = None,
@@ -132,21 +166,10 @@ async def chat_completions(
         stats_context: Optional[UsageStatsContext] = None,
         request_bytes: Optional[int] = None,
 ):
-    """执行 OpenAI Chat Completions 兼容请求。"""
+    """执行已转换的 Chat Completions 请求，供两个外部协议复用。"""
     try:
-        if stats_context is not None:
-            stats_context.capture_request_bytes(request_bytes or 0)
-        try:
-            request_body = await request.json()
-        except Exception as e:
-            logger.error("解析请求体失败: %s", e)
-            if stats_context is not None:
-                stats_context.mark_failure("validation_error", 400)
-            raise HTTPException(status_code=400, detail=f"Invalid JSON request body: {str(e)}")
-
         if stats_context is not None and isinstance(request_body, dict):
             stats_context.capture_request_shape(request_body)
-
         try:
             RequestProcessor.validate_request(request_body)
         except HTTPException as error:
@@ -230,6 +253,93 @@ async def chat_completions(
         raise HTTPException(status_code=500, detail=f"内部服务器错误: {str(e)}")
 
 
+async def chat_completions(
+        request: Request,
+        _user: AuthenticatedUser,
+        x_conversation_id: Optional[str] = None,
+        x_conversation_request_id: Optional[str] = None,
+        x_conversation_message_id: Optional[str] = None,
+        x_request_id: Optional[str] = None,
+        stats_context: Optional[UsageStatsContext] = None,
+        request_bytes: Optional[int] = None,
+):
+    """执行 OpenAI Chat Completions 兼容请求。"""
+    if stats_context is not None:
+        stats_context.capture_request_bytes(request_bytes or 0)
+    try:
+        request_body = await request.json()
+    except Exception as error:
+        logger.error("解析请求体失败: %s", error)
+        if stats_context is not None:
+            stats_context.mark_failure("validation_error", 400)
+        raise HTTPException(status_code=400, detail=f"Invalid JSON request body: {str(error)}")
+    return await _execute_chat_request(
+        request_body,
+        _user,
+        x_conversation_id=x_conversation_id,
+        x_conversation_request_id=x_conversation_request_id,
+        x_conversation_message_id=x_conversation_message_id,
+        x_request_id=x_request_id,
+        stats_context=stats_context,
+        request_bytes=request_bytes,
+    )
+
+
+async def responses(
+        request: Request,
+        _user: AuthenticatedUser,
+        x_conversation_id: Optional[str] = None,
+        x_conversation_request_id: Optional[str] = None,
+        x_conversation_message_id: Optional[str] = None,
+        x_request_id: Optional[str] = None,
+        stats_context: Optional[UsageStatsContext] = None,
+        request_bytes: Optional[int] = None,
+):
+    """将 Responses 请求适配到现有 Chat 服务并转换返回协议。"""
+    if stats_context is not None:
+        stats_context.capture_request_bytes(request_bytes or 0)
+    try:
+        try:
+            request_body = await request.json()
+        except Exception as error:
+            if stats_context is not None:
+                stats_context.mark_failure("validation_error", 400)
+            raise HTTPException(status_code=400, detail=f"Invalid JSON request body: {str(error)}")
+        chat_body = responses_to_chat(request_body)
+        response_id = new_response_id()
+        result = await _execute_chat_request(
+            chat_body,
+            _user,
+            x_conversation_id=x_conversation_id,
+            x_conversation_request_id=x_conversation_request_id,
+            x_conversation_message_id=x_conversation_message_id,
+            x_request_id=x_request_id,
+            stats_context=stats_context,
+            request_bytes=request_bytes,
+        )
+        if isinstance(result, StreamingResponse):
+            model = str(request_body.get("model") or "unknown")
+
+            async def body():
+                try:
+                    async for chunk in chat_sse_to_responses(result.body_iterator, response_id, model):
+                        yield chunk
+                finally:
+                    close = getattr(result.body_iterator, "aclose", None)
+                    if close is not None:
+                        await close()
+
+            return StreamingResponse(body(), media_type="text/event-stream", headers=SSE_HEADERS)
+        return chat_to_response(result, response_id)
+    except ResponsesAdapterError:
+        if stats_context is not None:
+            stats_context.mark_failure("validation_error", 400)
+        raise
+    except Exception as error:
+        logger.error("Responses 兼容 API 错误: %s", error)
+        raise
+
+
 async def list_v1_models(user: AuthenticatedUser):
     """获取 OpenAI V1 兼容模型列表。"""
     try:
@@ -260,6 +370,33 @@ def create_openai_compatible_router(
 ) -> APIRouter:
     """创建共享协议行为、使用指定认证方式的 OpenAI 兼容路由。"""
     router = APIRouter(route_class=PrivateNoStoreRoute)
+
+    @router.post(
+        "/v1/responses",
+        name=f"{route_name_prefix}_responses",
+        include_in_schema=include_in_schema,
+        openapi_extra={"requestBody": RESPONSES_OPENAPI_REQUEST_BODY},
+    )
+    async def responses_route(
+            request: Request,
+            x_conversation_id: Optional[str] = Header(None, alias="X-Conversation-ID"),
+            x_conversation_request_id: Optional[str] = Header(None, alias="X-Conversation-Request-ID"),
+            x_conversation_message_id: Optional[str] = Header(None, alias="X-Conversation-Message-ID"),
+            x_request_id: Optional[str] = Header(None, alias="X-Request-ID"),
+            _user: AuthenticatedUser = Depends(auth_dependency),
+    ):
+        stats_context = create_usage_stats_context(request, _user, stats_source)
+        request_bytes = len(await request.body())
+        return await responses(
+            request,
+            _user=_user,
+            x_conversation_id=x_conversation_id,
+            x_conversation_request_id=x_conversation_request_id,
+            x_conversation_message_id=x_conversation_message_id,
+            x_request_id=x_request_id,
+            stats_context=stats_context,
+            request_bytes=request_bytes,
+        )
 
     @router.post(
         "/v1/chat/completions",

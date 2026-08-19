@@ -110,6 +110,29 @@ class ProtocolRouteAuthenticationTests(TempConfigMixin, unittest.IsolatedAsyncio
         self.assertGreater(chat_completions.await_args_list[0].kwargs["request_bytes"], 0)
 
     @mock.patch(
+        "src.openai_router._execute_chat_request",
+        new_callable=mock.AsyncMock,
+        return_value={
+            "id": "chatcmpl-1",
+            "created": 123,
+            "model": "deepseek-v4-flash",
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+        },
+    )
+    async def test_responses_route_adapts_external_api_key_request(self, execute_chat):
+        response = await self._request(
+            "POST",
+            "/openai/v1/responses",
+            api_key=True,
+            json={"model": "deepseek-v4-flash", "input": "hello"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["object"], "response")
+        self.assertEqual(response.json()["output_text"], "ok")
+        self.assertEqual(execute_chat.await_args.args[0]["messages"][0]["content"], "hello")
+
+    @mock.patch(
         "src.openai_router.chat_completions",
         new_callable=mock.AsyncMock,
         side_effect=UpstreamAPIError(
