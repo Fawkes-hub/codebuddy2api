@@ -1,17 +1,19 @@
 services:
   codebuddy2api:
-    image: ghcr.io/iceean/codebuddy2api:latest
+    image: ${CODEBUDDY2API_IMAGE:-ghcr.io/iceean/codebuddy2api:latest}
     restart: unless-stopped
     ports:
       - "8001:8001"
     environment:
-      # 容器运行数据必须写入持久化挂载点，不接受 .env 覆盖。
+      # 运行数据必须写入持久化挂载点。
       CODEBUDDY_DATA_DIR: /app/data
+      # entrypoint 会将该文件复制到运行目录，应用只读取运行时副本。
+      CODEBUDDY_USERS_FILE: /app/secrets/users.txt
     volumes:
-      # SQLite 与 CodeBuddy 凭证持久化
+      # SQLite、OAuth 凭证及运行数据持久化。
       - ./data:/app/data
-      # 多用户认证目录；服务只读，add-user 命令使用单独的可写挂载。
-      - ./secrets:/app/secrets:ro
+      # 多用户认证目录必须可写，以便创建或轮换 users.txt。
+      - ./secrets:/app/secrets
     env_file:
       - path: .env
         required: false

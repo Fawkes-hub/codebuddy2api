@@ -1,569 +1,140 @@
-<h1 align="center">
-  <img src="frontend/public/assets/codebuddy2api.svg" alt="Logo" style="height: 3em; width: 3em;"><br />
-  CodeBuddy2API
-</h1>
+# CodeBuddy2API 接入说明
 
-<p align="center">
-  将 CodeBuddy 上游服务封装为 OpenAI Chat Completions 兼容接口，并提供多用户管理台、API Key、上游凭证隔离和自动轮换能力。
-</p>
+将 CodeBuddy 中国站（`copilot.tencent.com`）的模型通过 OpenAI 兼容接口暴露给本地应用使用。
+本文以本地命令行启动为主，Docker Compose 作为可选部署方式。
 
-<p align="center">
-  <a href="#本地运行">本地运行</a> ·
-  <a href="#docker-部署">Docker 部署</a> ·
-  <a href="#开始使用">开始使用</a>
-</p>
+## 架构
 
-> [!WARNING]
-> 本仓库代码通过 AI 生成，未经过严格的人工代码审查或安全审计，不能保证公开环境部署的安全性。建议仅在本地、内网使用；如确需公网部署，建议使用反向代理鉴权、IP 白名单等额外保护。不建议将本服务直接暴露在公网。
-
-## 支持协议
-
-- `POST /openai/v1/chat/completions`：兼容 OpenAI Chat Completions，支持流式和非流式客户端请求。
-- `GET /openai/v1/models`：返回当前用户可用的模型列表。
-- CodeBuddy 上游只提供流式响应；非流式客户端请求由本服务聚合后返回。
-- 暂未提供 Responses 等其他 OpenAI API，也未提供 Anthropic 兼容 API。
-
-## 本地运行
-
-### 前置要求
-
-- Python 3.10 或更高版本；建议使用 Python 3.12
-- 确保你的命令行网络可以访问 GitHub。你也可以选择手动从 [releases](https://github.com/IceeAn/codebuddy2api/releases) 页面下载 `codebuddy2api.zip`，解压并从命令行进入解压后的目录。
-
-### macOS / Linux
-
-1. 获取运行包
-
-> 如果选择手动下载、解压和进入目录，跳过此步骤
-
-```bash
-curl -fL -o codebuddy2api.tar.gz https://github.com/iceean/codebuddy2api/releases/latest/download/codebuddy2api.tar.gz
-tar -xzf codebuddy2api.tar.gz
-cd codebuddy2api
+```
+任意 OpenAI 兼容客户端
+   │  OpenAI 协议 + Bearer API Key
+   ▼
+codebuddy2api (本地进程或 Docker, 端口 8001, /openai/v1)
+   │  OAuth 凭证转发
+   ▼
+copilot.tencent.com (CodeBuddy 中国站账户)
 ```
 
-2. 启动服务
+- OpenAI 兼容端点：`http://127.0.0.1:8001/openai/v1`
+- 模型列表：`GET /openai/v1/models`
+- 健康检查：`GET /health`
+- 管理台：`http://127.0.0.1:8001`（用于 OAuth 授权、API Key 管理）
+
+## 命令行启动（推荐）
 
 ```bash
+cd /path/to/codebuddy2api
+
+# 首次运行：创建虚拟环境并安装依赖
 python3 -m venv venv
 source venv/bin/activate
 python3 -m pip install -r requirements.txt
 
-mkdir -p secrets data
+# 首次运行：创建运行目录和管理用户密码文件
+mkdir -p data secrets
 python3 scripts/hash_password.py admin --output secrets/users.txt
 
+# 启动服务，默认监听 127.0.0.1:8001
 python3 web.py
 ```
 
-`python3 scripts/hash_password.py admin --output secrets/users.txt` 会提示输入密码。输入并按下回车后，会将密码哈希写入 `secrets/users.txt`。重复执行并将 `admin` 改为新用户名可添加多个用户；使用已有用户名重复执行会删除旧记录并更新该用户的密码。
+后续启动只需激活虚拟环境并运行 `python3 web.py`。如使用 launchd 或其他进程管理器，
+请将工作目录设置为仓库目录，并让管理器负责自动重启。
 
-启动后访问 `http://127.0.0.1:8001`，继续执行 [开始使用](#开始使用)。
-
-### Windows PowerShell
-
-1. 获取运行包
-
-> 如果选择手动下载、解压和进入目录，跳过此步骤
-
-```powershell
-Invoke-WebRequest `
-  -Uri "https://github.com/iceean/codebuddy2api/releases/latest/download/codebuddy2api.zip" `
-  -OutFile "codebuddy2api.zip"
-Expand-Archive -Path "codebuddy2api.zip" -DestinationPath . -Force
-Set-Location codebuddy2api
-```
-
-2. 启动服务
-
-PowerShell 示例使用 Python Launcher `py -3`。如不可用，可以尝试将 `py -3` 替换为 `python`。
-
-```powershell
-py -3 -m venv venv
-.\venv\Scripts\python.exe -m pip install -r requirements.txt
-
-New-Item -ItemType Directory -Force secrets | Out-Null
-New-Item -ItemType Directory -Force data | Out-Null
-.\venv\Scripts\python.exe scripts\hash_password.py admin --output secrets\users.txt
-
-.\venv\Scripts\python.exe web.py
-```
-
-`.\venv\Scripts\python.exe scripts\hash_password.py admin --output secrets\users.txt` 会提示输入密码。输入并按下回车后，会将密码哈希写入 `secrets/users.txt`。重复执行并将 `admin` 改为新用户名可添加多个用户；使用已有用户名重复执行会删除旧记录并更新该用户的密码。
-
-启动后访问 `http://127.0.0.1:8001`，继续执行 [开始使用](#开始使用)。
-
-### 更新
-
-#### 使用更新脚本更新（建议，要求当前安装版本为 v0.2.0 或更高版本）
-
-0.2.0 版本起，Release 包内置更新脚本。更新脚本会在当前项目目录更新，保留 `data`、`secrets`、`.env` 和 Release 管理目录之外的其他文件，默认重新创建 `venv`，并在 `.update-backups/latest` 保存一份完整的更新前备份。
-
-更新前必须退出项目虚拟环境、停止当前服务。如果命令行不能访问 GitHub Releases，你也可以选择下载安装包到本地，并参考下文的“[指定本地文件更新](#use-update-script-with-release-file)”
-
-macOS / Linux：
+常用检查命令：
 
 ```bash
-# 退出项目虚拟环境
-deactivate 2>/dev/null || true
-
-# 更新到最新稳定版
-python3 scripts/update_release.py update
-
-# 更新完成后重新启动
-source venv/bin/activate
-python3 web.py
+curl http://127.0.0.1:8001/health
+curl http://127.0.0.1:8001/openai/v1/models \
+  -H "Authorization: Bearer sk-your-api-key"
 ```
 
-Windows PowerShell：
-
-```powershell
-# 退出项目虚拟环境
-deactivate
-
-# 更新到最新稳定版
-py -3 scripts\update_release.py update
-
-# 更新完成后重新启动
-.\venv\Scripts\python.exe web.py
-```
-
-如果旧 `venv` 仍然有效，并且希望减少重复安装未变化依赖的时间，可以添加 `--reuse-venv`：
-
-macOS / Linux：
+## 可选 Docker Compose 部署
 
 ```bash
-# 更新到最新稳定版
-python3 scripts/update_release.py update --reuse-venv
-```
+cd /path/to/codebuddy2api
 
-Windows PowerShell：
-
-```powershell
-# 更新到最新稳定版
-py -3 scripts\update_release.py update --reuse-venv
-```
-
-<a id="use-update-script-with-release-file"></a>也可以指定一个更高的稳定版本，或使用已经下载到本机的 Release 文件：
-
-```bash
-# 指定远程特定版本更新
-python3 scripts/update_release.py update --tag v1.2.3
-# 指定本地文件更新
-python3 scripts/update_release.py update \
-  --release-file ../codebuddy2api.tar.gz
-```
-
-```powershell
-# 指定远程特定版本更新
-py -3 scripts\update_release.py update --tag v1.2.3
-# 指定本地文件更新
-py -3 scripts\update_release.py update `
-  --release-file ..\codebuddy2api-v1.2.3.zip
-```
-
-本地文件名必须以 `codebuddy2api` 开头，并以 `.zip` 或 `.tar.gz` 结尾。
-
-交互式运行默认需要输入确认。自动化环境可以添加 `--yes` 或 `-y` 跳过确认。
-
-更新脚本会保留最近一份完整备份用于回滚。若新版启动异常，先再次停止服务并退出虚拟环境，再执行：
-
-```bash
-python3 scripts/update_release.py rollback
-```
-
-```powershell
-py -3 scripts\update_release.py rollback
-```
-
-回滚会完整恢复备份时点的代码、数据、配置和虚拟环境，并把回滚前的状态保存为新的 `.update-backups/latest`，因此可以再次执行同一命令撤销回滚。确认新版本长期运行正常后，可以手动删除 `.update-backups` 释放空间。
-
-#### 手动更新
-
-如果当前 Release 中还没有 `scripts/update_release.py`、当前目录是 Git 工作区，或者希望保留旧目录以便直接切换回旧版本，请使用手动更新。不建议把新版 Release 直接解压并覆盖旧目录，也不应把旧版本的 `venv`、程序文件或 `frontend/dist` 复制到新版目录。
-
-1. 从 [Releases](https://github.com/IceeAn/codebuddy2api/releases) 下载目标版本的 `.tar.gz` 或 `.zip`，解压到一个与旧目录分开的新目录。
-2. 停止旧服务并退出旧目录的虚拟环境。复制运行中的 SQLite 数据可能得到不一致的文件，因此必须在停止服务后再迁移数据。
-3. 将旧目录中的 `data`、`secrets` 和 `.env` 复制到新版目录；如果 `.env` 不存在，可以跳过。项目根目录中其他自行添加的文件不会自动迁移，请按需单独复制，但不要覆盖新版 Release 自带的文件。
-
-macOS / Linux：
-
-```bash
-cp -Rp /旧目录/codebuddy2api/data /新版目录/codebuddy2api/
-cp -Rp /旧目录/codebuddy2api/secrets /新版目录/codebuddy2api/
-cp -p /旧目录/codebuddy2api/.env /新版目录/codebuddy2api/  # .env 存在时执行
-```
-
-Windows PowerShell：
-
-```powershell
-Copy-Item C:\旧目录\codebuddy2api\data C:\新版目录\codebuddy2api\data -Recurse
-Copy-Item C:\旧目录\codebuddy2api\secrets C:\新版目录\codebuddy2api\secrets -Recurse
-if (Test-Path C:\旧目录\codebuddy2api\.env) {
-  Copy-Item C:\旧目录\codebuddy2api\.env C:\新版目录\codebuddy2api\.env
-}
-```
-
-4. 在新版目录中重新创建虚拟环境并安装依赖。
-
-macOS / Linux：
-
-```bash
-cd /新版目录/codebuddy2api
-python3 -m venv venv
-source venv/bin/activate
-python3 -m pip install -r requirements.txt
-python3 web.py
-```
-
-Windows PowerShell：
-
-```powershell
-Set-Location C:\新版目录\codebuddy2api
-py -3 -m venv venv
-.\venv\Scripts\python.exe -m pip install -r requirements.txt
-.\venv\Scripts\python.exe web.py
-```
-
-5. 登录管理台，确认原有用户、凭证、设置和统计数据可用，并实际发起一次请求。确认新版运行正常后，再删除旧目录。
-
-若新版启动或验证失败，先停止新版服务，再从旧目录重新启动旧版本。由于上述流程使用复制而不是移动来迁移数据，验证期间不要同时运行新旧两个版本，也不要让它们继续分别写入各自的数据；否则回到旧版本时，会丢失新版运行期间产生的变更。
-
-## Docker 部署
-
-推荐用 Docker 跑正式服务。本路径只依赖 Docker 和 Docker Compose。
-
-### 1. 获取 Compose 文件
-
-在你准备用于保存部署文件和运行数据的目录中执行：
-
-```bash
-curl -fsSL -o docker-compose.yml https://raw.githubusercontent.com/iceean/codebuddy2api/main/docker-compose.yml
-```
-
-> 也可以从本仓库的 [docker-compose.yml](docker-compose.yml) 复制内容并手动创建 `docker-compose.yml` 文件。
-
-### 2. 创建管理台用户
-
-```bash
-docker run --rm -it \
-  -v "$PWD/secrets:/app/secrets" \
-  ghcr.io/iceean/codebuddy2api:latest \
-  add-user admin
-```
-
-命令会提示输入密码，并原子更新 `secrets/users.txt`。需要多个管理台用户时，重复执行并替换用户名；再次使用已有用户名会删除旧记录并更新密码。`add-user` 容器需要可写目录挂载，正式服务只读挂载该目录。
-
-若服务已在运行，新增用户或更新密码后需要重启容器才能生效：
-
-```bash
-docker compose restart codebuddy2api
-```
-
-### 3. 启动服务
-
-```bash
 docker compose up -d
+docker compose ps
+docker compose logs -f --tail 50
+docker compose stop
 ```
 
-启动后访问 `http://127.0.0.1:8001`，继续执行 [开始使用](#开始使用)。
+Compose 会持久化 `data/` 和 `secrets/`。其中 `secrets/` 必须可写，因为首次创建或
+轮换管理用户时需要更新 `users.txt`。
 
-SQLite 与 CodeBuddy 凭证保存在当前目录的 `data` 中，系统用户保存在 `secrets/users.txt`。
+## 首次配置
 
-若需要通过域名、服务器 IP 访问服务、配置反向代理或修改其他配置，可参考 [.env.example](.env.example) 创建 `.env` 并配置相关环境变量后再启动。
+1. 复制 `.env.example` 为 `.env`，按需配置：
+   - `CODEBUDDY_API_ENDPOINT=https://copilot.tencent.com`（中国站）
+   - `CODEBUDDY_ALLOWED_API_ENDPOINTS=https://copilot.tencent.com,https://www.codebuddy.ai`
+   - `CODEBUDDY_MODELS=...hy3,hunyuan-t1,...`（与动态列表取并集）
+   - `CODEBUDDY_HOST=127.0.0.1`、`CODEBUDDY_PORT=8001`
+   - 只有需要局域网访问时才将 host 改为 `0.0.0.0`，并配合防火墙和可信网络使用
+2. 启动服务后打开 `http://127.0.0.1:8001`，登录管理台。
+3. 在“凭证管理”中启动 CodeBuddy 认证，完成上游账号授权。
+4. 在“API Keys”中创建客户端 Key，并只保存到客户端的本地安全配置中。
+5. 生产或长期运行时，建议定期轮换管理台密码、客户端 API Key 和上游授权。
 
-## 开始使用
+## 客户端配置
 
-服务启动后，按此顺序操作：
+- OpenAI 兼容 Base URL：`http://127.0.0.1:8001/openai/v1`
+- Responses 接口：`http://127.0.0.1:8001/openai/v1/responses`
+- Chat Completions 接口：`http://127.0.0.1:8001/openai/v1/chat/completions`
+- API Key：填写管理台生成的客户端 Key，例如 `sk-your-api-key`
+- Model：填写 `GET /openai/v1/models` 返回的模型 ID，例如 `hy3`
 
-1. 使用刚创建的系统用户名和密码登录。
-2. 在“凭证管理”中启动 CodeBuddy 认证并完成官方登录授权，也可以手动添加凭证。
-3. 确认凭证列表中至少有一个有效凭证。
-4. 在“API 密钥”中创建一个 `sk-...` API Key；请及时复制，明文只会在创建时展示一次。
+通用配置示例：
 
-拿到 API Key 后，可以先用 `curl` 验证：
+```yaml
+base_url: http://127.0.0.1:8001/openai/v1
+api_key: sk-your-api-key
+model: hy3
+api_mode: responses  # 不支持 Responses 的客户端可改为 chat_completions
+```
+
+如果客户端要求单独填写完整接口地址，请使用上面的 `/responses` 或
+`/chat/completions` 地址，不要重复拼接 `/openai/v1`。
+
+请求示例：
 
 ```bash
-curl "http://127.0.0.1:8001/openai/v1/chat/completions" \
-  -H "Authorization: Bearer sk-your_api_key" \
+curl http://127.0.0.1:8001/openai/v1/responses \
+  -H "Authorization: Bearer sk-your-api-key" \
   -H "Content-Type: application/json" \
-  -d '{
-    "model": "glm-5.2",
-    "messages": [
-      {"role": "user", "content": "你好，2+2 等于几？"}
-    ]
-  }'
+  -d '{"model":"hy3","input":"你好"}'
 ```
 
-把 `sk-your_api_key` 替换为管理台生成的 API Key。
+不要将真实 API Key、管理台密码、CodeBuddy OAuth 凭证或包含它们的配置文件提交到 Git。
 
-Windows PowerShell 可用以下命令验证：
+## 管理台和认证说明
 
-```powershell
-$body = @{
-  model = "glm-5.2"
-  messages = @(
-    @{
-      role = "user"
-      content = "你好，2+2 等于几？"
-    }
-  )
-} | ConvertTo-Json -Depth 4
+管理台地址为 `http://127.0.0.1:8001`，用于 OAuth 授权、管理用户和生成客户端 API Key。
+API 请求需要在请求头中携带 `Authorization: Bearer <客户端 API Key>`；该 Key 不等同于
+CodeBuddy 账户密码，也不等同于上游 OAuth Token。
 
-Invoke-RestMethod `
-  -Uri "http://127.0.0.1:8001/openai/v1/chat/completions" `
-  -Method Post `
-  -Headers @{ Authorization = "Bearer sk-your_api_key" } `
-  -ContentType "application/json" `
-  -Body $body
-```
+多用户认证文件为 `secrets/users.txt`。命令行部署使用脚本生成密码哈希；Docker 部署使用
+Compose 挂载的同一目录，避免容器重建后丢失用户数据。
 
-## 客户端使用
+## 故障排查
 
-兼容大部分支持允许自定义端点 URL 且支持 OpenAI Chat Completions 协议的客户端。
+| 现象 | 原因 | 处理 |
+|------|------|------|
+| `health` 无法访问 | 服务未启动或端口被占用 | 检查启动进程、launchd 状态或 `docker compose ps` |
+| `/openai/v1/models` 返回 401 | 未带客户端 API Key 或 Key 无效 | 使用管理台生成的 Key，检查 Bearer 请求头 |
+| `/responses` 返回 404 | 运行的不是包含 Responses 适配器的版本 | 停止旧进程后重新启动，并确认代码版本 |
+| 模型请求返回上游 401/403 | CodeBuddy OAuth 授权过期或无权限 | 在管理台重新完成 CodeBuddy 授权 |
+| Docker 容器反复重启 | `secrets/users.txt` 不存在或挂载不可写 | 检查 `secrets/` 权限，并重新生成用户文件 |
 
-手动调用示例如下（须将 `sk-your_api_key` 更换为上文获取的 API Key）：
+## 安全建议
 
-Python 示例需要另外安装 OpenAI SDK：
+- 仅在本机使用时绑定 `127.0.0.1`；对外提供服务时必须增加网络访问控制。
+- 不要把 `.env`、`data/`、`secrets/`、OAuth 导出文件或真实客户端配置加入版本库。
+- 发现 Key 或 OAuth 凭证泄露后，立即在管理台撤销并重新生成。
 
-```bash
-python3 -m pip install openai
-```
+## 备注
 
-```python
-import openai
-
-client = openai.OpenAI(
-    api_key="sk-your_api_key",
-    base_url="http://127.0.0.1:8001/openai/v1",
-)
-
-# 非流式请求
-response = client.chat.completions.create(
-    model="glm-5.2",
-    messages=[{"role": "user", "content": "你好"}],
-)
-print(response.choices[0].message.content)
-
-# 流式请求
-stream = client.chat.completions.create(
-    model="glm-5.2",
-    messages=[{"role": "user", "content": "写一个 Python Hello World"}],
-    stream=True,
-)
-for chunk in stream:
-    print(chunk.choices[0].delta.content or "", end="")
-```
-
-## 端点与鉴权边界
-
-| 调用方     | 路径                               | 鉴权方式                | 说明                             |
-| ---------- | ---------------------------------- | ----------------------- | -------------------------------- |
-| 外部客户端 | `/openai/v1/*`                     | `sk-...` Bearer API Key | 对外 OpenAI 兼容入口             |
-| Web 管理台 | `/auth/*`                          | 登录接口或会话 Cookie   | 登录、恢复会话、退出             |
-| Web 管理台 | `/api/admin/*`                     | 会话 Cookie             | 凭证、API Key、设置和状态管理    |
-| 开发文档   | `/docs`、`/redoc`、`/openapi.json` | 会话 Cookie             | Swagger、ReDoc 与 OpenAPI schema |
-| 监控系统   | `GET /health`                      | 无                      | 健康检查                         |
-
-登录管理台后，可从“开发文档”页面的按钮在新标签页打开 `/docs`；也可以在保持登录会话的浏览器中直接访问 `/docs` 或 `/redoc`。未登录请求会返回 401，`sk-...` API Key 不能代替管理台会话访问文档。
-
-OpenAPI 文档会展示外部 `/openai/v1/*` 的 Bearer API Key 鉴权和 Chat Completions 请求体。使用 Swagger 调试外部接口时，仍需通过 Authorize 填写管理台生成的 `sk-...` API Key。管理台测试入口 `/api/admin/playground/openai/v1/*` 不会出现在 schema 中。
-
-## 统计与隐私
-
-登录管理台后可从独立的“统计”页面查看当前系统用户的请求情况。页面展示请求数、成功率、Token、CodeBuddy credit 消耗、总耗时和首个有效输出耗时，并提供趋势和请求统计明细。 逐请求脱敏明细保留 90 天，UTC 小时汇总永久保留。
-
-统计记录不会保存提示词、回答、请求头、Bearer/CodeBuddy Token、工具参数、原始错误体或会话 ID。
-
-## 配置
-
-配置分为两类：
-
-1. 启动与安全边界配置：环境变量优先于代码默认值，只在服务启动时加载，不从 SQLite 读取。
-2. 用户级运行配置：管理台首次保存后按用户名写入 `data/codebuddy2api.sqlite3`；未保存的字段继承对应环境变量或代码默认值。
-
-以下表格反映当前配置；应用根目录下的 `.env` 是可选文件，仅用于覆盖默认值，不会向父目录搜索。
-
-### 启动与安全边界配置
-
-#### 服务启动与存储
-
-| 环境变量               | 默认值              | 说明                                                                                               |
-| ---------------------- | ------------------- | -------------------------------------------------------------------------------------------------- |
-| `CODEBUDDY_USERS_FILE` | `secrets/users.txt` | 系统用户文件路径；启动时必须存在且至少包含一个有效用户                                             |
-| `CODEBUDDY_HOST`       | `127.0.0.1`         | 本地启动监听地址                                                                                   |
-| `CODEBUDDY_PORT`       | `8001`              | 本地启动监听端口                                                                                   |
-| `CODEBUDDY_DATA_DIR`   | `data`              | 运行数据目录，包含 SQLite 和 `credentials/`；相对路径以应用根目录为基准，Docker 固定为 `/app/data` |
-| `CODEBUDDY_LOG_LEVEL`  | `INFO`              | `DEBUG`、`INFO`、`WARNING`、`ERROR` 或 `CRITICAL`                                                  |
-
-#### 上游连接安全
-
-| 环境变量                          | 默认值                        | 说明                                                    |
-| --------------------------------- | ----------------------------- | ------------------------------------------------------- |
-| `CODEBUDDY_API_ENDPOINT`          | `https://copilot.tencent.com` | CodeBuddy 上游；国际站可使用 `https://www.codebuddy.ai` |
-| `CODEBUDDY_ALLOWED_API_ENDPOINTS` | 中国站、国际站                | 可接收真实 CodeBuddy Token 的上游白名单                 |
-| `CODEBUDDY_SSL_VERIFY`            | `true`                        | 上游 TLS 证书校验；公网部署必须保持开启                 |
-
-#### 后台凭证任务节流
-
-| 环境变量                                                | 默认值 | 说明                                                                                  |
-| ------------------------------------------------------- | ------ | ------------------------------------------------------------------------------------- |
-| `CODEBUDDY_CREDENTIAL_BACKGROUND_DELAY_MIN_SECONDS`     | `5`    | 周期额度探测和自动签到相邻请求的最小启动间隔秒数                                       |
-| `CODEBUDDY_CREDENTIAL_BACKGROUND_DELAY_MAX_SECONDS`     | `20`   | 周期额度探测和自动签到相邻请求的最大启动间隔秒数；两类任务分别节流，不互相等待         |
-
-两项配置接受非负有限整数或小数，最小值不得大于最大值；相等时使用固定间隔，均为 `0` 时关闭节流。每小时额度扫描与定时/补偿签到会使用该随机区间；应用启动首轮额度扫描、添加凭证、OAuth 保存、账号切换、手动签到及签到后的额度重探测保持即时。
-
-#### HTTP 与浏览器安全
-
-| 环境变量                        | 默认值                | 说明                                                         |
-| ------------------------------- | --------------------- | ------------------------------------------------------------ |
-| `CODEBUDDY_ALLOWED_HOSTS`       | `localhost,127.0.0.1` | 允许访问本服务的 Host 头                                     |
-| `CODEBUDDY_ALLOWED_ORIGINS`     | 空                    | 允许跨域访问的浏览器 Origin；空表示不启用 CORS               |
-| `CODEBUDDY_CSP_FRAME_ANCESTORS` | `none`                | CSP 页面嵌入来源；支持 `self` 与空格分隔的 HTTP/HTTPS Origin |
-
-#### 登录与容量保护
-
-| 环境变量                                | 默认值     | 说明                                                         |
-| --------------------------------------- | ---------- | ------------------------------------------------------------ |
-| `CODEBUDDY_MAX_REQUEST_BODY_BYTES`      | `16777216` | 全局 HTTP 请求体上限；登录接口另有固定 8 KiB 上限            |
-| `CODEBUDDY_LOGIN_RATE_WINDOW_SECONDS`   | `60`       | 登录全局、IP、用户名三个独立速率桶共用的滑动窗口秒数         |
-| `CODEBUDDY_LOGIN_GLOBAL_MAX_ATTEMPTS`   | `60`       | 每个登录限流窗口允许的进程全局尝试数                         |
-| `CODEBUDDY_LOGIN_IP_MAX_ATTEMPTS`       | `10`       | 每个登录限流窗口允许的单一客户端 IP 尝试数                   |
-| `CODEBUDDY_LOGIN_USERNAME_MAX_ATTEMPTS` | `5`        | 每个登录限流窗口允许的单一用户名尝试数                       |
-| `CODEBUDDY_LOGIN_MAX_CONCURRENCY`       | `2`        | 同时进入工作线程或等待线程池的 PBKDF2 登录校验数；超限不排队 |
-| `CODEBUDDY_MAX_CONCURRENT_REQUESTS`     | 空         | Uvicorn 全局连接/任务并发上限；空表示不限制                  |
-
-`CODEBUDDY_API_ENDPOINT`、白名单 URL 或其他强类型配置无效时，服务会在启动阶段直接失败；不会回退到其他站点，也不会把真实 Token 转发到未明确授权的地址。
-
-### 用户级运行配置
-
-| 环境变量默认值                             | 默认值                                                 | 说明                             |
-|-------------------------------------|-----------------------------------------------------|--------------------------------|
-| `CODEBUDDY_MODELS`                  | `glm-5.2,deepseek-v4-pro`                           | 与 CodeBuddy 动态模型列表合并的附加模型      |
-| `CODEBUDDY_FORCED_REASONING_MODELS` | `deepseek-v4-pro,deepseek-v4-flash,glm-5.1,glm-5.2` | 强制启用最大推理参数的模型；空表示关闭            |
-| `CODEBUDDY_FORCED_TEMPERATURE`      | `1`                                                 | 强制覆盖 `temperature`；空表示保留客户端值   |
-| `CODEBUDDY_STRIP_MODEL_NAMESPACE`   | `true`                                              | 将 `provider/model` 转换为 `model` |
-| `CODEBUDDY_AUTO_ROTATION_ENABLED`   | `true`                                              | 是否自动轮换 CodeBuddy 凭证            |
-| `CODEBUDDY_AUTO_CHECKIN_ENABLED`    | `false`                                             | 是否在每天服务器时间 09:30 为有效个人版凭证自动签到  |
-| `CODEBUDDY_ROTATION_COUNT`          | `1`                                                 | 每 N 次请求切换凭证，必须为正整数             |
-
-## 架构概览
-
-```text
-外部客户端 ── /openai/v1 + API Key ──────────────────┐
-                                                     ├─> OpenAI 兼容处理 ─> 请求预处理
-Web 管理台 ── /api/admin/playground/openai/v1 + Cookie ┘                       │
-                                                                              v
-CodeBuddy 上游 <─ 流式请求与响应转换 <─ 用户凭证选择与轮换
-```
-
-主要职责边界：
-
-- `web.py`：FastAPI 组装、路由挂载和 Uvicorn 本地入口。
-- `config.py`：启动配置、用户级设置及其持久化。
-- `src/auth_*.py`、`src/*_store.py`：系统用户、会话和 API Key。
-- `src/openai_router.py`、`src/openai_compat.py`：OpenAI 协议入口和响应兼容。
-- `src/codebuddy_*.py`、`src/credential_*.py`：CodeBuddy OAuth、凭证存储与轮换。
-- `src/stream_service.py`、`src/sse.py`：上游流式请求、SSE 解析和非流式聚合。
-- `src/usage_stats_*.py`、`src/stats_router.py`：脱敏统计采集、SQLite 持久化、聚合查询与管理接口。
-- `frontend/`：Vue 管理台源码、构建产物和公共静态资源。
-
-## 开发、本地构建与验证
-
-### 后端开发运行
-
-```bash
-python3 -m venv venv
-source venv/bin/activate
-python3 -m pip install -r requirements-dev.txt
-
-mkdir -p secrets data
-python3 scripts/hash_password.py admin --output secrets/users.txt
-
-python3 web.py
-```
-
-### 前端开发运行
-
-前端开发和构建要求 Node.js 24.11+ 与 pnpm 10.29+。
-
-前端开发服务器会把 `/auth`、`/api`、`/codebuddy`、`/openai`、`/health`、`/docs`、`/redoc` 和 `/openapi.json` 代理到本地后端 `127.0.0.1:8001`。
-
-```bash
-cd frontend
-pnpm install --frozen-lockfile
-pnpm run dev
-```
-
-### 本地构建 Docker 镜像
-
-在源码目录中构建本地镜像：
-
-```bash
-docker build -t codebuddy2api:local .
-```
-
-可复用 [Docker 部署](#docker-部署) 中创建的 `data` 和 `secrets/users.txt` 启动本地镜像：
-
-```bash
-docker run -d \
-  --name codebuddy2api-local \
-  --restart unless-stopped \
-  -p 8001:8001 \
-  -v "$PWD/data:/app/data" \
-  -v "$PWD/secrets:/app/secrets:ro" \
-  codebuddy2api:local
-```
-
-### 验证
-
-后端使用标准库 `unittest` 和 `coverage.py`，对 `config.py`、`web.py`、`src/` 强制执行行/分支综合 100% 覆盖率：
-
-```bash
-source venv/bin/activate
-python3 -m coverage run -m unittest discover -s tests
-python3 -m coverage report
-```
-
-前端修改后按以下顺序验证：
-
-```bash
-cd frontend
-pnpm run format:check
-pnpm run lint
-pnpm run build
-pnpm run test:coverage
-```
-
-## 故障排除
-
-#### `Authentication users file not found` / `No authentication users configured`
-
-确认 `CODEBUDDY_USERS_FILE` 指向可读的用户文件，并且文件中至少有一条有效的 `用户名:PBKDF2哈希` 记录。
-
-#### `Invalid authentication credentials`
-
-- 外部客户端必须请求 `/openai/v1/*` 并发送 `Authorization: Bearer sk-...`。
-- 管理台测试请求必须访问 `/api/admin/playground/openai/v1/*` 并携带有效会话 Cookie。
-- API Key 所属系统用户从 `users.txt` 删除后，该 Key 也会失效。
-
-#### `凭证获取失败` 或没有可用模型
-
-当前系统用户没有可用的 CodeBuddy 上游凭证。登录管理台重新认证、添加凭证，并使用凭证测试功能确认状态。
-
-#### `CodeBuddy API error: 401` 或 `403`
-
-这是上游 CodeBuddy 拒绝凭证，不是本系统 API Key 失效。重新完成 CodeBuddy 认证或替换上游凭证。
-
-#### `Invalid host header`
-
-把实际访问域名加入 `CODEBUDDY_ALLOWED_HOSTS` 后重启服务。
-
-#### 查看详细日志
-
-设置 `CODEBUDDY_LOG_LEVEL=DEBUG` 后重启服务。日志可能包含请求元数据，不要在公开场合直接粘贴完整日志。
-
-## 授权协议
-
-本仓库当前的源代码基于 MIT 许可证授权。
-
-本仓库是无任何开源协议授权的上游项目 [xueyue33/codebuddy2api](https://github.com/xueyue33/codebuddy2api) 的一个 fork，并保留了原始 Git 提交历史，以用于署名和透明性说明。MIT 许可证仅适用于该 fork 维护者在当前工作区中独立重写的代码。该许可证不适用于历史提交、原上游项目代码，或任何可能出现在 Git 历史中的第三方材料。具体信息可参考 [LICENSING.md](LICENSING.md)。
+- `/responses` 用于兼容支持 OpenAI Responses API 的客户端；不支持该协议的客户端可使用
+  `/chat/completions`。
+- 模型能力取决于 CodeBuddy 上游账号和当前模型列表，客户端应以 `/openai/v1/models`
+  的实际返回值为准。
