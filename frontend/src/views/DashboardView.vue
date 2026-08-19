@@ -318,6 +318,63 @@ function openStats() {
           复制
         </CButton>
       </CInputGroup>
+
+      <div class="text-text-muted mt-4 space-y-4 text-sm">
+        <p>
+          其他客户端按 OpenAI 兼容方式配置。先到“API Keys”页面创建客户端 Key；这里的 Key
+          不是管理台密码，也不是 CodeBuddy OAuth 凭证。
+        </p>
+
+        <div class="grid gap-3 sm:grid-cols-3">
+          <div class="rounded-lg border border-border bg-surface-2 p-3">
+            <div class="text-xs font-semibold tracking-wide text-text-strong uppercase">
+              Base URL
+            </div>
+            <code class="mt-1 block font-mono text-xs break-all text-text-strong">
+              {{ statusData?.api_base_url || 'http://127.0.0.1:8001/openai/v1' }}
+            </code>
+            <p class="mt-2 text-xs">只填到 <code>/openai/v1</code>，不要追加具体接口路径。</p>
+          </div>
+          <div class="rounded-lg border border-border bg-surface-2 p-3">
+            <div class="text-xs font-semibold tracking-wide text-text-strong uppercase">
+              API Key
+            </div>
+            <code class="mt-1 block font-mono text-xs text-text-strong">sk-...</code>
+            <p class="mt-2 text-xs">使用“API Keys”页面生成的客户端 Key。</p>
+          </div>
+          <div class="rounded-lg border border-border bg-surface-2 p-3">
+            <div class="text-xs font-semibold tracking-wide text-text-strong uppercase">Model</div>
+            <code class="mt-1 block font-mono text-xs text-text-strong">GET /openai/v1/models</code>
+            <p class="mt-2 text-xs">填写模型列表中的模型 ID。</p>
+          </div>
+        </div>
+
+        <div class="grid gap-3 lg:grid-cols-2">
+          <div class="rounded-lg border border-brand-500/30 bg-soft-brand p-3">
+            <div class="font-semibold text-text-strong">Responses API</div>
+            <p class="mt-1 text-xs">适用于支持 OpenAI Responses 协议的客户端，例如 Codex。</p>
+            <code class="mt-2 block font-mono text-xs break-all text-text-strong">
+              POST {{ statusData?.api_base_url || 'http://127.0.0.1:8001/openai/v1' }}/responses
+            </code>
+            <p class="mt-2 text-xs">客户端协议选 <code>responses</code> 或 Responses API。</p>
+          </div>
+          <div class="rounded-lg border border-border bg-surface-2 p-3">
+            <div class="font-semibold text-text-strong">Chat Completions</div>
+            <p class="mt-1 text-xs">适用于只支持传统 OpenAI Chat Completions 的客户端。</p>
+            <code class="mt-2 block font-mono text-xs break-all text-text-strong">
+              POST
+              {{ statusData?.api_base_url || 'http://127.0.0.1:8001/openai/v1' }}/chat/completions
+            </code>
+            <p class="mt-2 text-xs">客户端协议选 <code>chat_completions</code> 或 OpenAI Chat。</p>
+          </div>
+        </div>
+
+        <CAlert type="info">
+          配置示例：<code>base_url</code> 填上面的 Base URL，<code>api_key</code> 填客户端 Key，
+          <code>model</code> 填模型 ID；如果客户端有 <code>api_mode</code>，Responses 填
+          <code>responses</code>，传统客户端填 <code>chat_completions</code>。
+        </CAlert>
+      </div>
     </CCard>
   </div>
 </template>

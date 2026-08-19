@@ -374,5 +374,8 @@ describe('DashboardView', () => {
     const wrapper = mountView();
     expect(wrapper.findComponent(CButton).exists()).toBe(true);
     expect(wrapper.findComponent(CInput).exists()).toBe(true);
+    expect(wrapper.text()).toContain('Responses API');
+    expect(wrapper.text()).toContain('Chat Completions');
+    expect(wrapper.text()).toContain('只填到 /openai/v1');
   });
 });
